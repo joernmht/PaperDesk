@@ -16,23 +16,25 @@ import java.net.URL
 class PaperDeskApp : Application() {
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
+        // breadcrumb: the box's server log shows "GET /api/health?stage=attach" if the process starts at all
+        Thread { ping(base) }.start()
+        // a crash from a previous launch is sent NOW, before any provider can crash this launch too
+        val old = crashFile(base)
+        if (old.exists()) {
+            val th = Thread { if (send(base, "(from a previous launch)\n" + old.readText())) old.delete() }
+            th.start(); th.join(6000)
+        }
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             try {
                 val f = crashFile(base)
                 f.writeText(report(t, e))
                 val th = Thread { if (send(base, f.readText())) f.delete() }
-                th.start(); th.join(4000)
+                th.start(); th.join(9000)
             } catch (_: Throwable) {
             }
             prev?.uncaughtException(t, e)
         }
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        val f = crashFile(this)
-        if (f.exists()) Thread { if (send(this, "(re-sent on next launch)\n" + f.readText())) f.delete() }.start()
     }
 
     companion object {
@@ -43,9 +45,17 @@ class PaperDeskApp : Application() {
                 "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), thread ${t.name}\n" +
                 e.stackTraceToString()
 
+        fun ping(ctx: Context) = try {
+            val c = URL(Prefs.url(ctx) + "/api/health?stage=attach&v=${BuildConfig.VERSION_CODE}").openConnection() as HttpURLConnection
+            c.connectTimeout = 5000; c.readTimeout = 5000
+            c.setRequestProperty("Authorization", "Bearer " + Prefs.token(ctx))
+            c.responseCode; c.disconnect()
+        } catch (_: Throwable) {
+        }
+
         fun send(ctx: Context, trace: String): Boolean = try {
             val c = URL(Prefs.url(ctx) + "/api/crash").openConnection() as HttpURLConnection
-            c.requestMethod = "POST"; c.connectTimeout = 3000; c.readTimeout = 3000; c.doOutput = true
+            c.requestMethod = "POST"; c.connectTimeout = 4000; c.readTimeout = 4000; c.doOutput = true
             c.setRequestProperty("Authorization", "Bearer " + Prefs.token(ctx))
             c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             c.outputStream.use { it.write(JSONObject().put("trace", trace).toString().toByteArray()) }
