@@ -888,6 +888,12 @@ class H(BaseHTTPRequestHandler):
                     return self._send(200, do_action(self._body()))
                 if p == "/api/rm/action":
                     return self._send(200, rm_action(self._body()))
+                if p == "/api/crash":
+                    trace = str(self._body().get("trace", ""))[:20000]
+                    with (STATE_DIR / "crash.log").open("a") as f:
+                        f.write(f"===== {now()}\n{trace}\n")
+                    add_event("crash", "💥 PaperDesk app crashed", trace.splitlines()[1][:200] if "\n" in trace else trace[:200])
+                    return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
         except (KeyError, ValueError) as e:
             return self._send(400, {"error": str(e)})

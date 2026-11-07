@@ -18,8 +18,8 @@ android {
         applicationId = "com.joernmht.paperdesk"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
         // Baked in from android/local.properties (never committed); overridable in Settings.
         buildConfigField("String", "DEFAULT_URL", "\"${lp("paperdesk.url", "https://paper1.tailbf37ab.ts.net:8447")}\"")
         buildConfigField("String", "DEFAULT_TOKEN", "\"${lp("paperdesk.token", "")}\"")
@@ -29,7 +29,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("debug")
         }
     }
