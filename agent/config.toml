@@ -1,0 +1,9 @@
+# PaperDesk agent model config. Any OpenAI-compatible endpoint works.
+# Testing: ScaDS.AI (TU Dresden, free, shared daily cap ~1500 req -- the paper studies use it too).
+[model]
+name = "openai/gpt-oss-120b"
+base_url = "https://llm.scads.ai/v1"
+api_key_env = "SCADS_API_KEY"
+temperature = 0.3
+timeout = 120
+choices = ["openai/gpt-oss-120b", "zai-org/GLM-5.3-Flash", "deepseek-ai/DeepSeek-V4.1-Flash", "mistralai/Mistral-Large-4"]
