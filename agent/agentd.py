@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 HOME = Path.home()
@@ -148,6 +148,15 @@ class NewThread(BaseModel):
 
 class ChatIn(BaseModel):
     text: str
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    m = CONFIG["model"]
+    return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>PaperDesk agent</title><body style="font-family:sans-serif;padding:16px">
+<h2>PaperDesk agent is running</h2><p>Version {VERSION} &middot; model <code>{m['name']}</code>
+via {m['base_url']}</p><p>Chat from the PaperDesk app. API: <code>/api/agent/health</code>.</p>"""
 
 
 @app.get("/api/agent/health")
