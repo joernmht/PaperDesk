@@ -177,6 +177,14 @@ def dexec(tid: str, argv: list[str], *, input: bytes | None = None, timeout: int
     return _run(["docker", "exec", "-i", "-w", "/workspace", name, *argv], input=input, timeout=timeout + 15)
 
 
+def interrupt(tid: str) -> None:
+    """Cancel: stop every process the agent runs in its container (`kill -1` spares PID 1, so the container
+    stays up). The pending `execute` call then returns and the run can end."""
+    name = cname(tid)
+    if _state(name) == "running":
+        _run(["docker", "exec", name, "bash", "-c", "kill -TERM -1; sleep 2; kill -KILL -1"], timeout=30)
+
+
 class DockerSandbox(BaseSandbox):
     """deepagents sandbox backend: every file/shell op runs inside the chat's container."""
 

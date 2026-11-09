@@ -8,10 +8,15 @@ Model: any OpenAI-compatible endpoint, configured in agent/config.toml (default:
 Tools: DeepAgent built-ins (todos, files, shell, sub-agents) running inside a per-chat Docker
 sandbox (see sandbox.py), GitHub read tools, and approval-gated writes (comment, issue, PR).
 The agent never touches the box's own filesystem or shell.
+
+Runs are detached from the HTTP request: /chat and /resume start the turn in a background thread, and a
+client disconnect never stops it. Every event is numbered per chat (`seq`) and logged in pd_events, so the
+app can reconnect with GET /threads/{tid}/events?since=<seq>.
 """
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -39,11 +44,19 @@ DIR = Path(__file__).resolve().parent
 STATE = HOME / ".local/state/paperdesk"
 DB_PATH = STATE / "agent.sqlite"
 TOKEN_FILE = HOME / ".config/paperdesk/token"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 CONFIG = tomllib.loads((DIR / "config.toml").read_text())
 POLICY = ghtools.Policy(CONFIG.get("github", {}))
 APPROVALS_DEFAULT = CONFIG.get("approvals", {}).get("default", "auto")
+LIMITS = CONFIG["model"].get("limits", {})  # per model: max_input_tokens, max_output_tokens
+CONTEXT_BUDGET = int(CONFIG["model"].get("context_budget", 200_000))
+SUMMARIZE_AT = 0.85  # deepagents summarises at this fraction of a model's (profile) window
+PING_S = 15  # a tail sends {"type":"ping"} after this many silent seconds
+TERMINAL = ("done", "error")  # every run ends with exactly one of these
+KEEP_EVENTS = 20_000  # per chat; older events are pruned when a run starts
+ORIGIN_RE = re.compile(r"[A-Za-z0-9:._-]{1,40}")
+SOLO = "paperdesk-solo"  # harness-profile key for chats without sub-agents (no `task` tool)
 
 # EU-ONLY model hosting (Joern 2026-11-09). Chat content (incl. private repos, EBL) may only reach LLM
 # endpoints hosted in Europe. Hosts are allow-listed here in code ON PURPOSE, so a config edit alone cannot
@@ -108,34 +121,80 @@ def now() -> str:
 # ---------------------------------------------------------------- persistence
 def _conn() -> sqlite3.Connection:
     STATE.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("""CREATE TABLE IF NOT EXISTS pd_threads(
         id TEXT PRIMARY KEY, title TEXT, created TEXT, updated TEXT, model TEXT)""")
-    if "repos" not in [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]:
-        c.execute("ALTER TABLE pd_threads ADD COLUMN repos TEXT DEFAULT '[]'")  # chat setup: [{repo, mode}]
-    if "approvals" not in [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]:
-        c.execute("ALTER TABLE pd_threads ADD COLUMN approvals TEXT")  # auto | ask | NULL = config default
+    have = [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]
+    for col, decl in (("repos", "TEXT DEFAULT '[]'"),  # chat setup: [{repo, mode}]
+                      ("approvals", "TEXT"),            # auto | ask | NULL = config default
+                      ("subagents", "INTEGER"),         # 0 = no `task` tool | NULL = on
+                      ("origin", "TEXT")):              # who opened the chat, e.g. "loop:agent-scout"
+        if col not in have:
+            c.execute(f"ALTER TABLE pd_threads ADD COLUMN {col} {decl}")
+    # detached runs: every event of every run, numbered per chat, so a client can reconnect and replay
+    c.execute("""CREATE TABLE IF NOT EXISTS pd_events(
+        tid TEXT, seq INTEGER, run TEXT, ev TEXT, PRIMARY KEY(tid, seq))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS pd_runs(id TEXT PRIMARY KEY, tid TEXT, kind TEXT, started TEXT,
+        ended TEXT, status TEXT, first_seq INTEGER, last_seq INTEGER, pid INTEGER)""")
+    c.execute("CREATE INDEX IF NOT EXISTS pd_runs_tid ON pd_runs(tid, first_seq)")
     c.commit()
     return c
 
 
 DB = _conn()
 DB_LOCK = threading.Lock()
+EV_DB = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)  # own connection = own transactions
+EV_LOCK = threading.Lock()
 THREAD_LOCKS: dict[str, threading.Lock] = {}
 CHECKPOINTER = None
-AGENTS: "OrderedDict[tuple[str, str], object]" = OrderedDict()
+AGENTS: "OrderedDict[tuple, object]" = OrderedDict()
 
 
-def build_agent(tid: str, model_name: str, approvals: str):
-    from deepagents import create_deep_agent
-    from deepagents.backends import CompositeBackend, StateBackend
+def model_limits(name: str) -> dict:
+    """Window from config + what the agent actually uses (capped by context_budget)."""
+    lim = dict(LIMITS.get(name, {}))
+    if "max_input_tokens" in lim:
+        eff = min(int(lim["max_input_tokens"]), CONTEXT_BUDGET)
+        lim.update(effective_input_tokens=eff, summarize_at=int(eff * SUMMARIZE_AT))
+    return lim
+
+
+@functools.cache
+def _llm_class():
+    """ChatOpenAI whose provider tag picks the deepagents harness profile: SOLO disables the general-purpose
+    sub-agent, which removes the `task` tool and its prompt section."""
+    from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
     from langchain_openai import ChatOpenAI
 
+    register_harness_profile(SOLO, HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)))
+
+    class PaperDeskLLM(ChatOpenAI):
+        pd_provider: str = "openai"
+
+        def _get_ls_params(self, stop=None, **kwargs):
+            params = super()._get_ls_params(stop=stop, **kwargs)
+            params["ls_provider"] = self.pd_provider
+            return params
+
+    return PaperDeskLLM
+
+
+def build_agent(row: dict):
+    from deepagents import create_deep_agent
+    from deepagents.backends import CompositeBackend, StateBackend
+
+    tid, model_name, approvals = row["id"], row["model"], row["approvals"]
     m = CONFIG["model"]
     _check_eu(m)  # every agent build re-checks the endpoint
-    llm = ChatOpenAI(model=model_name, base_url=m["base_url"], api_key=os.environ[m["api_key_env"]],
-                     temperature=m.get("temperature", 0.3), timeout=m.get("timeout", 120), max_retries=2)
+    extra = {}
+    lim = model_limits(model_name)
+    if "effective_input_tokens" in lim:  # a known window makes deepagents summarise at a fraction of it
+        extra["profile"] = {"max_input_tokens": lim["effective_input_tokens"]}
+    llm = _llm_class()(model=model_name, base_url=m["base_url"], api_key=os.environ[m["api_key_env"]],
+                       temperature=m.get("temperature", 0.3), timeout=m.get("timeout", 120), max_retries=2,
+                       pd_provider="openai" if row["subagents"] else SOLO, **extra)
     tools, interrupt_on = ghtools.make_tools(tid, POLICY)
     # files + shell in the chat's container; offloaded context stays in the checkpointed state
     backend = CompositeBackend(default=sandbox.DockerSandbox(tid), routes={"/_agent/": StateBackend()},
@@ -159,18 +218,16 @@ def forget_agent(tid: str) -> None:
             AGENTS.pop(key)
 
 
-def agent_for(tid: str, model_name: str, approvals: str | None = None):
+def agent_for(row: dict):
+    """Cached compiled agent for a chat row (its settings are part of the key)."""
     global CHECKPOINTER
-    if approvals is None:
-        row = thread_row(tid)
-        approvals = (row or {}).get("approvals") or APPROVALS_DEFAULT
     with DB_LOCK:
         if CHECKPOINTER is None:
             from langgraph.checkpoint.sqlite import SqliteSaver
             CHECKPOINTER = SqliteSaver(DB)
-        key = (tid, model_name, approvals)
+        key = (row["id"], row["model"], row["approvals"], row["subagents"])
         if key not in AGENTS:
-            AGENTS[key] = build_agent(tid, model_name, approvals)
+            AGENTS[key] = build_agent(row)
             while len(AGENTS) > 16:
                 AGENTS.popitem(last=False)
         AGENTS.move_to_end(key)
@@ -287,8 +344,8 @@ def turns(rows: list[dict]) -> list[dict]:
     return out
 
 
-def history(tid: str, model_name: str) -> list[dict]:
-    st = agent_for(tid, model_name).get_state({"configurable": {"thread_id": tid}})
+def history(row: dict) -> list[dict]:
+    st = agent_for(row).get_state({"configurable": {"thread_id": row["id"]}})
     out = []
     for msg in (st.values or {}).get("messages", []):
         kind = msg.type
@@ -309,13 +366,15 @@ def history(tid: str, model_name: str) -> list[dict]:
     return out
 
 
-COLS = ("id", "title", "created", "updated", "model", "repos", "approvals")
+COLS = ("id", "title", "created", "updated", "model", "repos", "approvals", "subagents", "origin")
 
 
 def _row(r) -> dict:
     d = dict(zip(COLS, r))
     d["repos"] = json.loads(d.get("repos") or "[]")
     d["approvals"] = d.get("approvals") or APPROVALS_DEFAULT
+    d["subagents"] = d.get("subagents") is None or bool(d["subagents"])
+    d["running"] = d["id"] in RUNS
     return d
 
 
@@ -353,41 +412,178 @@ def attach_pending(tid: str, row: dict):
                    "text": f"ERROR: {e}"[:500]}
 
 
-# ---------------------------------------------------------------- streaming
+# ---------------------------------------------------------------- detached runs
 APPROVE_WORDS = {"approve", "approved", "yes", "y", "ok", "okay", "go", "ja", "do it", "👍"}
 
 
-def _stream(tid: str, row: dict, inp, lock: threading.Lock):
-    """Run one agent turn; yield NDJSON events. `inp` is a user text or a langgraph Command."""
-    from langgraph.types import Command
+class Run:
+    """One agent turn in its own thread. It holds the chat's lock until it has fully ended; its events stay in
+    memory while it lives (live tails read them there) and are flushed to pd_events in small batches."""
 
+    def __init__(self, row: dict, kind: str, first_seq: int, lock: threading.Lock):
+        self.id = uuid.uuid4().hex[:12]
+        self.row, self.tid, self.kind, self.lock = row, row["id"], kind, lock
+        self.first_seq = self.next_seq = first_seq
+        self.events: list[dict] = []
+        self.cond = threading.Condition()
+        self.cancel = threading.Event()
+        self._terminal = False
+        self.finished = False  # terminal event emitted and stored
+        self.started = now()
+        self.t0 = self.t_last = time.time()
+        self.activity = "starting"
+        self._unflushed: list[dict] = []
+        self._t_flush = time.time()
+
+    def emit(self, ev: dict) -> None:
+        if ev["type"] in TERMINAL or ev["type"] == "start":
+            ev = {**ev, "run": self.id}
+        terminal = ev["type"] in TERMINAL
+        with self.cond:
+            if self._terminal:
+                return  # exactly one terminal event per run
+            self._terminal = terminal
+            ev = {"seq": self.next_seq, **ev}
+            self.next_seq += 1
+            self.events.append(ev)
+            self._unflushed.append(ev)
+            self.t_last = time.time()
+            if not terminal:
+                self.cond.notify_all()
+        if terminal or len(self._unflushed) >= 50 or time.time() - self._t_flush > 1:
+            self.flush()
+        if terminal:  # tails see it only once it is in the DB
+            with self.cond:
+                self.finished = True
+                self.cond.notify_all()
+
+    def flush(self) -> None:
+        with self.cond:
+            batch, self._unflushed = self._unflushed, []
+        self._t_flush = time.time()
+        if batch:
+            with EV_LOCK:
+                EV_DB.executemany("INSERT OR REPLACE INTO pd_events(tid,seq,run,ev) VALUES(?,?,?,?)",
+                                  [(self.tid, e["seq"], self.id, json.dumps(e)) for e in batch])
+                EV_DB.commit()
+
+    def status(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "started": self.started, "first_seq": self.first_seq,
+                "elapsed": int(time.time() - self.t0), "activity": self.activity,
+                "cancelling": self.cancel.is_set()}
+
+
+RUNS: dict[str, Run] = {}  # tid -> live run (removed once it has fully ended)
+
+
+def _max_seq(tid: str) -> int:
+    with EV_LOCK:
+        return EV_DB.execute("SELECT MAX(seq) FROM pd_events WHERE tid=?", (tid,)).fetchone()[0] or 0
+
+
+def last_seq(tid: str) -> int:
+    run = RUNS.get(tid)
+    return run.next_seq - 1 if run else _max_seq(tid)
+
+
+def start_run(row: dict, inp, kind: str, lock: threading.Lock, label: str) -> Run:
+    """Start one agent turn in a background thread. The caller holds the chat's lock; the run releases it."""
+    tid = row["id"]
+    try:
+        first = _max_seq(tid) + 1
+        run = Run(row, kind, first, lock)
+        with EV_LOCK:
+            EV_DB.execute("DELETE FROM pd_events WHERE tid=? AND seq<=?", (tid, first - KEEP_EVENTS))
+            EV_DB.execute("INSERT INTO pd_runs(id,tid,kind,started,status,first_seq,pid) VALUES(?,?,?,?,?,?,?)",
+                          (run.id, tid, kind, run.started, "running", first, os.getpid()))
+            EV_DB.commit()
+        RUNS[tid] = run
+        threading.Thread(target=_run_main, args=(run, inp, label), name=f"run-{tid}", daemon=True).start()
+        return run
+    except BaseException:
+        RUNS.pop(tid, None)
+        lock.release()
+        raise
+
+
+def _run_main(run: Run, inp, label: str) -> None:
+    """The terminal event goes out LAST, right before the chat unlocks, so a client that sees `done` can
+    send its next message or approval at once. Only a cancel sends done early (closing may take a while)."""
+    term = None
+    try:
+        run.emit({"type": "start", "kind": run.kind, "text": label, "model": run.row["model"]})
+        for ev in _turn_events(run, inp):
+            if ev["type"] in TERMINAL and not ev.get("cancelled"):
+                term = ev
+                continue
+            run.emit(ev)
+            if ev.get("cancelled"):
+                term = ev
+    except Exception as e:  # surface model/API errors to the app instead of a dead stream
+        term = term or {"type": "error", "text": f"{type(e).__name__}: {e}"[:500]}
+    finally:
+        term = term or {"type": "error", "text": "the run ended without an answer"}
+        status = "cancelled" if term.get("cancelled") else term["type"]
+        try:
+            run.flush()
+            with DB_LOCK:
+                DB.execute("UPDATE pd_threads SET updated=? WHERE id=?", (now(), run.tid))
+                DB.commit()
+        finally:
+            run.emit(term)  # no-op if the cancel already sent it
+            if RUNS.get(run.tid) is run:
+                RUNS.pop(run.tid)
+            run.lock.release()
+        with EV_LOCK:
+            EV_DB.execute("UPDATE pd_runs SET ended=?, status=?, last_seq=? WHERE id=?",
+                          (now(), status, run.next_seq - 1, run.id))
+            EV_DB.commit()
+
+
+def _turn_events(run: Run, inp):
+    """One agent turn as event dicts (seq is added by Run.emit). `inp` is a user text or a langgraph Command."""
+    row, tid = run.row, run.tid
     cfg = {"configurable": {"thread_id": tid}, "recursion_limit": 300}
     final: list[str] = []
     seg = None  # id of the model message whose tokens are streaming
+    writing: dict = {}  # tool-call args the model is still generating: index -> [name, chars]
+    run.activity = "attaching repos"
+    yield from attach_pending(tid, row)
+    agent = agent_for(row)
+    # middleware nodes may re-send the whole message list as an "update": emit each message once
+    seen = {getattr(m, "id", None) for m in (agent.get_state(cfg).values or {}).get("messages", [])}
+    if isinstance(inp, str):
+        pend = pending_approvals(agent, cfg)
+        if pend:  # plain-chat fallback: a typed "yes" approves, anything else rejects with that reason
+            ok = inp.strip().lower().rstrip("!.") in APPROVE_WORDS
+            inp = _decision_command(pend, "approve" if ok else "reject", None if ok else inp)
+        else:
+            inp = {"messages": [{"role": "user", "content": inp}]}
+    run.activity = "thinking"
+    stream = agent.stream(inp, cfg, stream_mode=["messages", "updates"])
     try:
-        for ev in attach_pending(tid, row):
-            yield json.dumps(ev) + "\n"
-        agent = agent_for(tid, row["model"])
-        # middleware nodes may re-send the whole message list as an "update": emit each message once
-        seen = {getattr(m, "id", None) for m in (agent.get_state(cfg).values or {}).get("messages", [])}
-        if isinstance(inp, str):
-            pend = pending_approvals(agent, cfg)
-            if pend:  # plain-chat fallback: a typed "yes" approves, anything else rejects with that reason
-                ok = inp.strip().lower().rstrip("!.") in APPROVE_WORDS
-                inp = _decision_command(pend, "approve" if ok else "reject", None if ok else inp)
-            else:
-                inp = {"messages": [{"role": "user", "content": inp}]}
-        for mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]):
+        for mode, data in stream:
+            if run.cancel.is_set():
+                break
             if mode == "messages":
                 chunk, meta = data
-                if chunk.type in ("AIMessageChunk", "ai") and meta.get("langgraph_node") == "model" \
-                        and "|" not in meta.get("langgraph_checkpoint_ns", ""):
-                    t = _text(chunk.content)
-                    if t:
-                        if chunk.id != seg:
-                            seg, final = chunk.id, []
-                        final.append(t)
-                        yield json.dumps({"type": "token", "text": t, "seg": seg}) + "\n"
+                if chunk.type not in ("AIMessageChunk", "ai") or meta.get("langgraph_node") != "model":
+                    continue
+                if "|" in meta.get("langgraph_checkpoint_ns", ""):
+                    run.activity = "sub-agent working"
+                    continue
+                t = _text(chunk.content)
+                if t:
+                    if chunk.id != seg:
+                        seg, final = chunk.id, []
+                    final.append(t)
+                    run.activity = "writing"
+                    yield {"type": "token", "text": t, "seg": seg}
+                for tcc in getattr(chunk, "tool_call_chunks", None) or []:
+                    w = writing.setdefault(tcc.get("index") or 0, ["", 0])
+                    w[0] = tcc.get("name") or w[0]
+                    w[1] += len(tcc.get("args") or "")
+                    run.activity = f"preparing {w[0] or 'a tool call'} ({w[1]:,} chars)"
             elif mode == "updates":
                 for node, upd in (data or {}).items():
                     if not isinstance(upd, dict):
@@ -399,31 +595,107 @@ def _stream(tid: str, row: dict, inp, lock: threading.Lock):
                             continue
                         seen.add(mid)
                         if getattr(msg, "type", "") == "ai":
+                            writing.clear()
                             if getattr(msg, "tool_calls", None):
                                 # text streamed before these tool calls was narration, not the answer
                                 if _text(msg.content).strip():
-                                    yield json.dumps({"type": "segment", "seg": mid, "final": False}) + "\n"
+                                    yield {"type": "segment", "seg": mid, "final": False}
                                 if mid == seg:
                                     final = []
                             for tc in getattr(msg, "tool_calls", None) or []:
                                 ev = call_event(tc)
                                 if tc["name"] in ghtools.GATED and row.get("approvals") == "auto":
                                     ev["auto_approved"] = True
-                                yield json.dumps(ev) + "\n"
+                                run.activity = f"running {tc['name']}: {ev['title']}"[:200]
+                                yield ev
                                 if tc["name"] == "write_todos":
-                                    yield json.dumps(todos_event(tc.get("args"))) + "\n"
+                                    yield todos_event(tc.get("args"))
                         elif getattr(msg, "type", "") == "tool":
-                            yield json.dumps(result_event(msg)) + "\n"
-        for ev in pending_approvals(agent, cfg):
-            yield json.dumps(ev) + "\n"
-        yield json.dumps({"type": "done", "text": "".join(final)}) + "\n"
-    except Exception as e:  # surface model/API errors to the app instead of a dead stream
-        yield json.dumps({"type": "error", "text": f"{type(e).__name__}: {e}"[:500]}) + "\n"
+                            run.activity = "thinking"
+                            yield result_event(msg)
+        if run.cancel.is_set():
+            yield {"type": "done", "text": "", "cancelled": True}
+            return  # finally: closing the graph stream may wait for an in-flight model call or tool
+        yield from pending_approvals(agent, cfg)
+        yield {"type": "done", "text": "".join(final)}
     finally:
-        with DB_LOCK:
-            DB.execute("UPDATE pd_threads SET updated=? WHERE id=?", (now(), tid))
-            DB.commit()
-        lock.release()
+        stream.close()
+
+
+def tail(tid: str, since: int | None):
+    """Events of a chat with seq > since, then the live run until its terminal event; ends at once when
+    nothing runs. since=None: from the start of the latest run. Pings (no seq) every PING_S silent seconds."""
+    run = RUNS.get(tid)
+    if since is None:
+        if run:
+            since = run.first_seq - 1
+        else:
+            with EV_LOCK:
+                r = EV_DB.execute("SELECT first_seq FROM pd_runs WHERE tid=? ORDER BY first_seq DESC LIMIT 1",
+                                  (tid,)).fetchone()
+            since = r[0] - 1 if r else 0
+    with EV_LOCK:
+        if run:
+            rows = EV_DB.execute("SELECT ev FROM pd_events WHERE tid=? AND seq>? AND seq<? ORDER BY seq",
+                                 (tid, since, run.first_seq)).fetchall()
+        else:
+            rows = EV_DB.execute("SELECT ev FROM pd_events WHERE tid=? AND seq>? ORDER BY seq",
+                                 (tid, since)).fetchall()
+    for (ev,) in rows:
+        yield json.loads(ev)
+    if run is None:
+        return
+    i = max(0, since + 1 - run.first_seq)
+    t_sent = time.time()
+    while True:
+        with run.cond:
+            while len(run.events) <= i and not run.finished:
+                left = PING_S - (time.time() - t_sent)
+                if left <= 0:
+                    break
+                run.cond.wait(timeout=left)
+            new = run.events[i:]
+            i += len(new)
+            over = run.finished and i >= len(run.events)
+        for ev in new:
+            yield ev
+        if over:
+            return
+        if not new:
+            yield {"type": "ping", "run": run.id, "activity": run.activity, "elapsed": int(time.time() - run.t0),
+                   "idle": int(time.time() - run.t_last)}
+        t_sent = time.time()
+
+
+def _ndjson(events):
+    for ev in events:
+        yield json.dumps(ev) + "\n"
+
+
+def _alive_agentd(pid: int) -> bool:
+    try:
+        return b"agentd.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
+def recover_runs() -> None:
+    """Runs that were live when the service stopped can never finish: close each with an error event."""
+    with EV_LOCK:
+        rows = EV_DB.execute("SELECT id, tid, pid FROM pd_runs WHERE status='running'").fetchall()
+    for rid, tid, pid in rows:
+        if pid and pid != os.getpid() and _alive_agentd(pid):
+            continue  # e.g. a terminal chat in another process
+        seq = _max_seq(tid) + 1
+        ev = {"seq": seq, "type": "error", "run": rid,
+              "text": "The agent service restarted during this run, so it stopped. Send a message to continue."}
+        with EV_LOCK:
+            EV_DB.execute("INSERT OR REPLACE INTO pd_events(tid,seq,run,ev) VALUES(?,?,?,?)",
+                          (tid, seq, rid, json.dumps(ev)))
+            EV_DB.execute("UPDATE pd_runs SET status='interrupted', ended=?, last_seq=? WHERE id=?",
+                          (now(), seq, rid))
+            EV_DB.commit()
+        threading.Thread(target=sandbox.interrupt, args=(tid,), daemon=True).start()  # orphaned commands
 
 
 def _decision_command(pend: list[dict], decision: str, message: str | None):
@@ -450,6 +722,7 @@ def _begin(tid: str) -> tuple[dict, threading.Lock]:
 # ---------------------------------------------------------------- API
 @asynccontextmanager
 async def _lifespan(_app):
+    recover_runs()  # close runs a previous service process left open
     threading.Thread(target=sandbox.reaper_loop, daemon=True).start()  # stops idle sandboxes
     yield
 
@@ -474,11 +747,14 @@ class NewThread(BaseModel):
     model: str | None = None
     repos: list[RepoSpec] = []
     approvals: str | None = None  # auto | ask (default from config)
+    subagents: bool = True  # False = no `task` tool
+    origin: str | None = None  # who opens the chat, e.g. "loop:agent-scout" (app labels it)
 
 
 class ThreadPatch(BaseModel):
     title: str | None = None
     approvals: str | None = None
+    subagents: bool | None = None
 
 
 class ChatIn(BaseModel):
@@ -501,16 +777,22 @@ on {HOSTING} (EU-hosted only)</p><p>Chat from the PaperDesk app. API: <code>/api
 
 @app.get("/api/agent/health")
 def health():
-    return {"ok": True, "version": VERSION, "model": CONFIG["model"]["name"],
-            "models": CONFIG["model"].get("choices", [CONFIG["model"]["name"]]),
-            "hosting": HOSTING, "region": "EU", "approvals_default": APPROVALS_DEFAULT,
-            "features": ["github_read", "sandbox", "pull_requests", "approvals", "repos"]}
+    models = CONFIG["model"].get("choices", [CONFIG["model"]["name"]])
+    return {"ok": True, "version": VERSION, "model": CONFIG["model"]["name"], "models": models,
+            "limits": {n: model_limits(n) for n in models}, "context_budget": CONTEXT_BUDGET,
+            "summarize_fraction": SUMMARIZE_AT, "hosting": HOSTING, "region": "EU",
+            "approvals_default": APPROVALS_DEFAULT, "running": len(RUNS), "ping_s": PING_S,
+            "features": ["github_read", "sandbox", "pull_requests", "approvals", "repos", "detached_runs",
+                         "events", "cancel", "subagents_toggle", "origin", "limits"]}
 
 
 @app.get("/api/agent/threads", dependencies=[Depends(authed)])
 def list_threads():
     rows = DB.execute(f"SELECT {','.join(COLS)} FROM pd_threads ORDER BY updated DESC LIMIT 100").fetchall()
-    return {"threads": [_row(r) for r in rows]}
+    with EV_LOCK:
+        seqs = dict(EV_DB.execute("SELECT tid, MAX(seq) FROM pd_events GROUP BY tid").fetchall())
+    return {"threads": [{**_row(r), "last_seq": last_seq(r[0]) if r[0] in RUNS else seqs.get(r[0], 0)}
+                        for r in rows]}
 
 
 _REPO_CACHE: dict = {"t": 0.0, "repos": []}
@@ -586,11 +868,13 @@ def new_thread(body: NewThread):
             raise HTTPException(400, str(e))
     if body.approvals not in (None, "auto", "ask"):
         raise HTTPException(400, "approvals must be auto or ask")
+    if body.origin is not None and not ORIGIN_RE.fullmatch(body.origin):
+        raise HTTPException(400, "origin: 1-40 chars of A-Z a-z 0-9 : . _ -")
     tid = uuid.uuid4().hex[:12]
     with DB_LOCK:
-        DB.execute(f"INSERT INTO pd_threads({','.join(COLS)}) VALUES(?,?,?,?,?,?,?)",
+        DB.execute(f"INSERT INTO pd_threads({','.join(COLS)}) VALUES(?,?,?,?,?,?,?,?,?)",
                    (tid, body.title or "New chat", now(), now(), model, json.dumps(specs),
-                    body.approvals or APPROVALS_DEFAULT))
+                    body.approvals or APPROVALS_DEFAULT, int(body.subagents), body.origin))
         DB.commit()
     return thread_row(tid)  # repos are cloned when the first message runs (shown as attach_repo boxes)
 
@@ -606,8 +890,10 @@ def patch_thread(tid: str, body: ThreadPatch):
             DB.execute("UPDATE pd_threads SET title=? WHERE id=?", (body.title[:80], tid))
         if body.approvals:
             DB.execute("UPDATE pd_threads SET approvals=? WHERE id=?", (body.approvals, tid))
+        if body.subagents is not None:
+            DB.execute("UPDATE pd_threads SET subagents=? WHERE id=?", (int(body.subagents), tid))
         DB.commit()
-    forget_agent(tid)
+    forget_agent(tid)  # a running turn keeps its settings; the next one uses the new ones
     return thread_row(tid)
 
 
@@ -615,9 +901,15 @@ def patch_thread(tid: str, body: ThreadPatch):
 def delete_thread(tid: str):
     if not re.fullmatch(r"[0-9a-f]{12}", tid):
         raise HTTPException(400, "bad id")
+    if tid in RUNS:
+        raise HTTPException(409, "this chat is running; cancel it first")
     with DB_LOCK:
         DB.execute("DELETE FROM pd_threads WHERE id=?", (tid,))
         DB.commit()
+    with EV_LOCK:
+        EV_DB.execute("DELETE FROM pd_events WHERE tid=?", (tid,))
+        EV_DB.execute("DELETE FROM pd_runs WHERE tid=?", (tid,))
+        EV_DB.commit()
     forget_agent(tid)
     if CHECKPOINTER is not None:
         CHECKPOINTER.delete_thread(tid)
@@ -627,37 +919,52 @@ def delete_thread(tid: str):
 
 @app.get("/api/agent/threads/{tid}", dependencies=[Depends(authed)])
 def get_thread(tid: str):
+    """Chat with history. While `running`, turns[-1] is the live turn as far as the checkpointer has it;
+    replay it in full with GET .../events (no `since`) and follow it there."""
     row = thread_row(tid)
     if not row:
         raise HTTPException(404, "no such thread")
-    agent = agent_for(tid, row["model"])
-    msgs = history(tid, row["model"])
+    agent = agent_for(row)
+    msgs = history(row)
+    run = RUNS.get(tid)
     return {**row, "messages": msgs, "turns": turns(msgs), "workspace": sandbox.workspace(tid),
-            "pending_approvals": pending_approvals(agent, {"configurable": {"thread_id": tid}})}
+            "pending_approvals": pending_approvals(agent, {"configurable": {"thread_id": tid}}),
+            "last_seq": last_seq(tid), "run": run.status() if run else None}
+
+
+def _set_title(tid: str, row: dict, text: str) -> None:
+    if row["title"] == "New chat":
+        with DB_LOCK:
+            DB.execute("UPDATE pd_threads SET title=? WHERE id=?", (text.strip()[:60], tid))
+            DB.commit()
 
 
 @app.post("/api/agent/threads/{tid}/chat", dependencies=[Depends(authed)])
 def chat(tid: str, body: ChatIn):
-    """NDJSON stream; event types: token, tool_call, tool_result, todos, approval, done, error.
-    While an approval is pending, a chat message answers it ("yes" approves, anything else rejects)."""
+    """Start a detached run (an app disconnect never stops it) and stream its events as NDJSON until its
+    done/error event. Event types: start, token, segment, tool_call, tool_result, todos, approval, done,
+    error, ping. While an approval is pending, a chat message answers it ("yes" approves, anything else
+    rejects). 409 while the chat is still running."""
     if not body.text.strip():
         raise HTTPException(400, "empty message")
     row, lock = _begin(tid)
-    if row["title"] == "New chat":
-        with DB_LOCK:
-            DB.execute("UPDATE pd_threads SET title=? WHERE id=?", (body.text.strip()[:60], tid))
-            DB.commit()
-    return StreamingResponse(_stream(tid, row, body.text, lock), media_type="application/x-ndjson")
+    try:
+        _set_title(tid, row, body.text)
+    except Exception:
+        lock.release()
+        raise
+    run = start_run(row, body.text, "chat", lock, body.text)
+    return StreamingResponse(_ndjson(tail(tid, run.first_seq - 1)), media_type="application/x-ndjson")
 
 
 @app.post("/api/agent/threads/{tid}/resume", dependencies=[Depends(authed)])
 def resume(tid: str, body: ResumeIn):
-    """Answer the pending approval(s) of a chat; streams the continuation like /chat."""
+    """Answer the pending approval(s) of a chat; runs and streams the continuation like /chat."""
     if body.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision must be approve or reject")
     row, lock = _begin(tid)
     try:
-        pend = pending_approvals(agent_for(tid, row["model"]), {"configurable": {"thread_id": tid}})
+        pend = pending_approvals(agent_for(row), {"configurable": {"thread_id": tid}})
     except Exception:
         lock.release()
         raise
@@ -665,9 +972,31 @@ def resume(tid: str, body: ResumeIn):
         lock.release()
         raise HTTPException(409, "nothing to approve")
     cmd = _decision_command(pend, body.decision, body.message)
-    return StreamingResponse(_stream(tid, row, cmd, lock), media_type="application/x-ndjson")
+    label = body.decision + (f": {body.message}" if body.message else "")
+    run = start_run(row, cmd, "resume", lock, label)
+    return StreamingResponse(_ndjson(tail(tid, run.first_seq - 1)), media_type="application/x-ndjson")
 
 
+@app.get("/api/agent/threads/{tid}/events", dependencies=[Depends(authed)])
+def events(tid: str, since: int | None = None):
+    """Reconnect: NDJSON replay of the chat's events with seq > since (no since = from the start of the
+    latest run), then the live run until its done/error event. Ends at once when nothing is running."""
+    if not thread_row(tid):
+        raise HTTPException(404, "no such thread")
+    return StreamingResponse(_ndjson(tail(tid, since)), media_type="application/x-ndjson")
+
+
+@app.post("/api/agent/threads/{tid}/cancel", dependencies=[Depends(authed)])
+def cancel(tid: str):
+    """Stop the running turn: the model stream is dropped at its next chunk and running sandbox commands
+    are killed. The run then ends with done {cancelled: true}. 409 when nothing is running."""
+    run = RUNS.get(tid)
+    if not run:
+        raise HTTPException(409, "nothing is running")
+    run.cancel.set()
+    run.activity = "cancelling"
+    threading.Thread(target=sandbox.interrupt, args=(tid,), daemon=True).start()
+    return {"ok": True, "run": run.status()}
 
 
 def main():
@@ -681,18 +1010,24 @@ def main():
     c.add_argument("--model", default=None)
     c.add_argument("--repo", action="append", default=[], help="owner/name[:write] (repeatable)")
     c.add_argument("--ask", action="store_true", help="this chat asks before writes")
+    c.add_argument("--no-subagents", action="store_true", help="no `task` tool in this chat")
+    c.add_argument("--origin", default=None, help='label, e.g. "loop:agent-scout"')
     a = ap.parse_args()
     if a.cmd == "serve":
         import uvicorn
-        uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="info")
+        uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="info", timeout_graceful_shutdown=3)
         return
     specs = [RepoSpec(repo=r.split(":")[0], mode="write" if r.endswith(":write") else "read") for r in a.repo]
-    tid = a.thread or new_thread(NewThread(model=a.model, repos=specs, approvals="ask" if a.ask else None))["id"]
+    tid = a.thread or new_thread(NewThread(model=a.model, repos=specs, approvals="ask" if a.ask else None,
+                                           subagents=not a.no_subagents, origin=a.origin))["id"]
     row, lock = _begin(tid)
+    _set_title(tid, row, a.text)
     t0 = time.time()
-    for line in _stream(tid, row, a.text, lock):
-        ev = json.loads(line)
-        if ev["type"] == "token":
+    run = start_run(row, a.text, "chat", lock, a.text)
+    for ev in tail(tid, run.first_seq - 1):
+        if ev["type"] == "ping":
+            print(f"\n  .. {ev['activity']} ({ev['elapsed']}s)", end="", flush=True)
+        elif ev["type"] == "token":
             print(ev["text"], end="", flush=True)
         elif ev["type"] == "tool_call":
             print(f"\n[{ev['kind']}] {ev['name']}: {ev['title']}")
@@ -702,6 +1037,8 @@ def main():
             print("  todos: " + " | ".join(f"[{i['status']}] {i['content']}" for i in ev["items"]))
         elif ev["type"] in ("approval", "error"):
             print(f"\n[{ev['type'].upper()}] {ev['text']}")
+    while tid in RUNS:  # let the run thread finish its bookkeeping before the process exits
+        time.sleep(0.1)
     print(f"\n-- thread {tid}, {time.time() - t0:.1f}s")
 
 

@@ -33,35 +33,62 @@ A LangChain [DeepAgent](https://github.com/langchain-ai/deepagents) chat service
 - Model choice (ScaDS, 2026-11-09): DeepSeek-V4.1-Flash is the default because it completed clone -> venv ->
   479 tests -> edit -> commit -> PR on its own (~5 min); gpt-oss-120b (fast for chat) and GLM-5.3-Flash stalled.
 - Venv: `virtualenv ~/.venvs/deepagent && ~/.venvs/deepagent/bin/pip install -r requirements.txt`.
-- Start/restart: `./start.sh [--restart]`. Terminal test: `agentd.py chat "question" [--thread ID]`.
+- Start/restart: `./start.sh [--restart [--force]]`. Terminal test: `agentd.py chat "question" [--thread ID] [--no-subagents] [--origin X]`.
 
 ## API (all but health need `Authorization: Bearer <token>`)
-- `GET  /api/agent/health` → `{ok, version, model, models}`
-- `GET  /api/agent/threads` → `{threads: [{id, title, created, updated, model}]}`
-- `POST /api/agent/threads` body `{title?, model?, repos?: [{repo, mode: "read"|"write"}]}` → thread (repos are
-  cloned when the first message runs and show up as `attach_repo` boxes)
+- `GET  /api/agent/health` → `{ok, version, model, models, limits: {model: {max_input_tokens, max_output_tokens,
+  effective_input_tokens, summarize_at}}, context_budget, summarize_fraction, hosting, region, approvals_default,
+  running, ping_s, features}`. Context: deepagents summarises old messages at 85 % of
+  `min(window, context_budget)` and keeps the newest 10 % (`[model.limits]` + `context_budget` in config.toml).
+- `GET  /api/agent/threads` → `{threads: [thread + last_seq]}`. A thread is `{id, title, created, updated, model,
+  repos, approvals: auto|ask, subagents: bool, origin: str|null, running: bool}`.
+- `POST /api/agent/threads` body `{title?, model?, repos?: [{repo, mode: "read"|"write"}], approvals?,
+  subagents?: bool (default true; false = no `task` tool), origin?: "loop:agent-scout" (1-40 chars A-Za-z0-9:._-)}`
+  → thread (repos are cloned when the first message runs and show up as `attach_repo` boxes)
 - `GET  /api/agent/repos` → `{repos: [{repo, description, on_box, private, pushed, writable}]}` for the picker
   (deny-listed repos left out; `writable` = owner allowed for write mode)
 - `POST /api/agent/threads/<id>/repos` body `{repo, mode}` → `{attached, workspace}`: attach now (400 on refusal)
 - `DELETE /api/agent/threads/<id>/repos/<name>` → `{workspace}`: detach (a writable copy's unpushed work is lost)
-- `PATCH /api/agent/threads/<id>` body `{title?, approvals?: "auto"|"ask"}`; threads carry `approvals`
+- `PATCH /api/agent/threads/<id>` body `{title?, approvals?: "auto"|"ask", subagents?: bool}` (a running turn
+  keeps its settings; the next one uses the new ones)
 - workspace entries: `{repo, dir, mode, branch, source: box|github|box+github, masked?}`
-- `GET  /api/agent/threads/<id>` → thread + `messages: [{role: user|assistant|tool_call|tool_result, text, name?}]`
-- `DELETE /api/agent/threads/<id>`
+- `DELETE /api/agent/threads/<id>` (409 while it runs: cancel first)
 - `GET  /api/agent/threads/<id>` → thread + `messages` (flat) + `turns: [{user, steps: [rows], answer}]` (steps =
   tool boxes, todos and `narration` text, for the collapsed "steps" dropdown; `answer` = final Markdown or null)
-  + `workspace: [{repo, dir, mode, branch}]` + `pending_approvals: [approval event]`. Rows carry the event fields
-  below (`role` = user | assistant | narration | tool_call | tool_result | todos).
-- `POST /api/agent/threads/<id>/chat` body `{text}` → NDJSON stream, one event per line. 409 while that chat is
-  busy. While an approval is pending, a chat message answers it: "yes/ok/approve/ja" approves, anything else
-  rejects with that text as the reason.
-- `POST /api/agent/threads/<id>/resume` body `{decision: "approve"|"reject", message?}` → same NDJSON stream.
+  + `workspace` + `pending_approvals: [approval event]` + `last_seq` + `run` (null, or while running
+  `{id, kind, started, first_seq, elapsed, activity, cancelling}`). Rows carry the event fields below
+  (`role` = user | assistant | narration | tool_call | tool_result | todos). While running, `turns[-1]` is the
+  live turn as far as the checkpointer has it: replace it with the `/events` replay.
+
+### Runs are detached (0.5)
+- `POST /api/agent/threads/<id>/chat` body `{text}` starts a run in a background thread and streams its events
+  as NDJSON until its `done`/`error` event. A dropped connection (screen lock, Tailscale reconnect) never stops
+  the run. 409 while the chat is running. While an approval is pending, a chat message answers it:
+  "yes/ok/approve/ja" approves, anything else rejects with that text as the reason.
+- `POST /api/agent/threads/<id>/resume` body `{decision: "approve"|"reject", message?}` → same, as a run.
+- `GET  /api/agent/threads/<id>/events?since=<seq>` → reconnect: NDJSON replay of the events with seq > since, then
+  the live run until its `done`/`error`; the stream ends at once when nothing runs. No `since` = from the start
+  of the latest run (the usual reconnect). Read to EOF: with an old `since` the replay can hold several runs.
+- `POST /api/agent/threads/<id>/cancel` → `{ok, run}`; 409 when nothing runs. The model stream is dropped at its
+  next chunk and the sandbox's running commands are killed; the run ends with `done {cancelled: true}`.
+  `running` can stay true a few seconds after that, until an in-flight model call returns (/chat → 409
+  meanwhile). A reply the model was already writing is still kept in the history.
+- Every event except `ping` carries `seq` (per chat, contiguous, from 1). Events live in `pd_events`
+  (last 20 000 per chat). If the service restarts during a run, that run gets a closing
+  `error {text: "The agent service restarted …"}` at the next start.
+- `start.sh --restart` refuses while runs are live (exit 2); `--restart --force` restarts anyway.
 
 ### Events (render each non-token event as a box)
+- `start {run, kind: chat|resume, text, model}`: first event of a run; `text` = the user message (or
+  "approve" / "reject: reason" for a resume), so a replay can draw the user bubble.
 - `token {text, seg}`: Markdown text delta; `seg` = id of the model message it belongs to.
 - `segment {seg, final: false}`: the text streamed under `seg` was narration before tool calls → move it into the
   steps dropdown. Text of a `seg` that never gets this event is the answer.
-- `done {text}`: the final answer only (Markdown). `error {text}`.
+- `done {run, text, cancelled?}`: the final answer only (Markdown). `error {run, text}`. Exactly one of them ends
+  every run, and it is sent only once the chat is unlocked (the next message can go out at once).
+- `ping {run, activity, elapsed, idle}` (no seq, not stored): sent after 15 s without events, e.g. while a shell
+  command runs or the model writes long tool arguments. `activity` = "running execute: pytest -q",
+  "preparing write_file (12,345 chars)", "writing", "thinking", "sub-agent working", "cancelling".
 - UI pattern Joern asked for: while running, show the steps collapsed as one dropdown whose header is the latest
   running step (the newest `tool_call` without a `tool_result` yet); at the end only the answer stays expanded.
 - `tool_call {id, name, kind, title, args, text}` and `tool_result {id, name, kind, ok, text, exit_code?, url?}`:

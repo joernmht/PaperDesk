@@ -12,6 +12,17 @@ region = "EU"
 temperature = 0.3
 timeout = 120
 choices = ["deepseek-ai/DeepSeek-V4.1-Flash", "openai/gpt-oss-120b", "zai-org/GLM-5.3-Flash", "mistralai/Mistral-Large-4"]
+# Context: old messages are summarised at 85 % of min(window, context_budget), the newest 10 % are kept.
+# The budget caps the 1M-token models: every agent step resends the whole context, so 85 % of 1M would make
+# late steps slow and less focused. gpt-oss (131k) stays below the budget and now summarises in time.
+context_budget = 200000
+
+[model.limits]
+# max_input_tokens / max_output_tokens as reported by ScaDS /v1/models (2026-11-09)
+"deepseek-ai/DeepSeek-V4.1-Flash" = { max_input_tokens = 1048576, max_output_tokens = 1048576 }
+"openai/gpt-oss-120b" = { max_input_tokens = 131072, max_output_tokens = 131072 }
+"zai-org/GLM-5.3-Flash" = { max_input_tokens = 1048576, max_output_tokens = 1048576 }
+"mistralai/Mistral-Large-4" = { max_input_tokens = 524288, max_output_tokens = 65536 }
 
 [approvals]
 # auto = PRs, comments, issues and writable clones run without asking (Joern 2026-11-09: "the default can be
