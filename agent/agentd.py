@@ -5,19 +5,24 @@ Runs on 127.0.0.1:8800 (published on the tailnet as https://paper1.<tailnet>.ts.
 (~/.config/paperdesk/token). Conversations persist in a LangGraph SQLite checkpointer.
 
 Model: any OpenAI-compatible endpoint, configured in agent/config.toml (default: ScaDS.AI).
-Phase 1 tools: the DeepAgent built-ins only (todo list, virtual in-state files, sub-agents).
-The agent has NO access to the box's real filesystem or shell.
+Tools: DeepAgent built-ins (todos, files, shell, sub-agents) running inside a per-chat Docker
+sandbox (see sandbox.py), GitHub read tools, and approval-gated writes (comment, issue, PR).
+The agent never touches the box's own filesystem or shell.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sqlite3
+import sys
 import threading
 import time
 import tomllib
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,21 +30,46 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # run with python -I: add our own dir only
+import ghtools  # noqa: E402
+import sandbox  # noqa: E402
+
 HOME = Path.home()
 DIR = Path(__file__).resolve().parent
 STATE = HOME / ".local/state/paperdesk"
 DB_PATH = STATE / "agent.sqlite"
 TOKEN_FILE = HOME / ".config/paperdesk/token"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 CONFIG = tomllib.loads((DIR / "config.toml").read_text())
+POLICY = ghtools.Policy(CONFIG.get("github", {}))
 
-SYSTEM_PROMPT = """You are Joern's research assistant inside his PaperDesk phone app.
+SYSTEM_PROMPT = """You are Joern's research and coding assistant inside his PaperDesk phone app.
 Joern is a PhD researcher at TU Dresden (Chair of Railway Operations) working on LLMs and
-mixed-integer linear programming (MILP) for railway rescheduling.
-Answer concisely: he reads you on a phone. Use Markdown sparingly (short lists, `code`).
-For multi-step work, plan with the todo tool and keep notes in your virtual files.
-If you do not know something, say so instead of guessing."""
+mixed-integer linear programming (MILP) for railway rescheduling. His GitHub account is joernmht.
+
+Style: he reads you on a phone. Be concise. Use Markdown (short lists, `code`, small code blocks).
+Say so when you do not know something instead of guessing.
+
+Your computer: a private Linux sandbox (Debian, Python 3.12, git, make, internet for pip; no sudo).
+Your file tools and the `execute` shell run there. Work under /workspace with absolute paths.
+For multi-step work, plan with write_todos and keep it updated.
+
+GitHub: use the github_* tools to read repos, issues, PRs, files and CI runs.
+
+Coding workflow (when asked to change code):
+1. clone_repo("joernmht/<name>") -> the repo appears at /workspace/<name> on a work branch.
+2. Read the code, make focused changes, follow the repo's style and its CLAUDE.md/README if present.
+3. Test in a virtual environment OUTSIDE the repo dir, e.g.
+   python -m venv /workspace/.venvs/<name> && . /workspace/.venvs/<name>/bin/activate && pip install -e '.[test]'
+   (or the repo's documented install), then run its test suite (e.g. pytest -q). Fix until green.
+4. git add/commit with clear messages (never commit venvs, caches or secrets).
+5. review_changes("<name>"), then open_pull_request("<name>", title, body) as a draft. The body says
+   what changed and how it was tested. Joern approves the push on his phone.
+Be efficient: set up and run the tests early, use one targeted grep instead of many reads, and stop
+exploring once you know enough. Batch related shell commands into one execute call.
+Never edit .github/ (CI) files; they are refused. Comments and new issues also need his approval.
+If he rejects an action, read his reason and adapt."""
 
 
 def now() -> str:
@@ -60,45 +90,46 @@ def _conn() -> sqlite3.Connection:
 DB = _conn()
 DB_LOCK = threading.Lock()
 THREAD_LOCKS: dict[str, threading.Lock] = {}
+CHECKPOINTER = None
+AGENTS: "OrderedDict[tuple[str, str], object]" = OrderedDict()
 
 
-def build_agent(checkpointer, model_name: str | None = None):
+def build_agent(tid: str, model_name: str):
     from deepagents import create_deep_agent
+    from deepagents.backends import CompositeBackend, StateBackend
     from langchain_openai import ChatOpenAI
 
     m = CONFIG["model"]
-    llm = ChatOpenAI(
-        model=model_name or m["name"],
-        base_url=m["base_url"],
-        api_key=os.environ[m["api_key_env"]],
-        temperature=m.get("temperature", 0.3),
-        timeout=m.get("timeout", 120),
-        max_retries=2,
-    )
-    return create_deep_agent(model=llm, tools=[], system_prompt=SYSTEM_PROMPT,
-                             checkpointer=checkpointer)
+    llm = ChatOpenAI(model=model_name, base_url=m["base_url"], api_key=os.environ[m["api_key_env"]],
+                     temperature=m.get("temperature", 0.3), timeout=m.get("timeout", 120), max_retries=2)
+    tools, interrupt_on = ghtools.make_tools(tid, POLICY)
+    # files + shell in the chat's container; offloaded context stays in the checkpointed state
+    backend = CompositeBackend(default=sandbox.DockerSandbox(tid), routes={"/_agent/": StateBackend()},
+                               artifacts_root="/_agent")
+    return create_deep_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, backend=backend,
+                             interrupt_on=interrupt_on, checkpointer=CHECKPOINTER)
 
 
-def make_checkpointer():
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    return SqliteSaver(DB)
-
-
-CHECKPOINTER = None
-AGENTS: dict[str, object] = {}
-
-
-def agent_for(model_name: str):
+def agent_for(tid: str, model_name: str):
     global CHECKPOINTER
     with DB_LOCK:
         if CHECKPOINTER is None:
-            CHECKPOINTER = make_checkpointer()
-        if model_name not in AGENTS:
-            AGENTS[model_name] = build_agent(CHECKPOINTER, model_name)
-        return AGENTS[model_name]
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            CHECKPOINTER = SqliteSaver(DB)
+        key = (tid, model_name)
+        if key not in AGENTS:
+            AGENTS[key] = build_agent(tid, model_name)
+            while len(AGENTS) > 16:
+                AGENTS.popitem(last=False)
+        AGENTS.move_to_end(key)
+        return AGENTS[key]
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- event shaping (app boxes)
+FILE_TOOLS = {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete_file"}
+GIT_TOOLS = {"clone_repo", "review_changes", "open_pull_request"}
+
+
 def _text(content) -> str:
     if isinstance(content, str):
         return content
@@ -107,21 +138,99 @@ def _text(content) -> str:
     return str(content or "")
 
 
-def history(thread_id: str, model_name: str) -> list[dict]:
-    st = agent_for(model_name).get_state({"configurable": {"thread_id": thread_id}})
+def _kind(name: str) -> str:
+    if name == "execute":
+        return "shell"
+    if name in FILE_TOOLS:
+        return "file"
+    if name == "write_todos":
+        return "todos"
+    if name == "task":
+        return "subagent"
+    if name in GIT_TOOLS:
+        return "git"
+    if name.startswith("github_"):
+        return "github"
+    return "tool"
+
+
+def _title(name: str, args: dict) -> str:
+    a = args or {}
+    if name == "execute":
+        return a.get("command", "")[:160]
+    if name in FILE_TOOLS:
+        return str(a.get("file_path") or a.get("path") or a.get("pattern") or "")[:160]
+    if name == "task":
+        return str(a.get("description", ""))[:160]
+    bits = [str(a[k]) for k in ("repo", "repo_dir_name", "number", "title", "path") if a.get(k)]
+    return " · ".join(bits)[:160]
+
+
+def _short_args(args: dict) -> dict:
+    return {k: (v[:2000] + "…" if isinstance(v, str) and len(v) > 2000 else v) for k, v in (args or {}).items()}
+
+
+def call_event(tc: dict) -> dict:
+    return {"type": "tool_call", "id": tc.get("id"), "name": tc["name"], "kind": _kind(tc["name"]),
+            "title": _title(tc["name"], tc.get("args")), "args": _short_args(tc.get("args")),
+            "text": json.dumps(tc.get("args"))[:400]}
+
+
+def result_event(msg) -> dict:
+    name = getattr(msg, "name", "") or ""
+    text = _text(msg.content)
+    art = getattr(msg, "artifact", None)
+    code = art.get("exit_code") if isinstance(art, dict) else None
+    ok = getattr(msg, "status", "success") != "error" and not text.startswith(("ERROR:", "Error:")) \
+        and (code in (None, 0))
+    ev = {"type": "tool_result", "id": getattr(msg, "tool_call_id", None), "name": name, "kind": _kind(name),
+          "ok": ok, "text": text[:2000]}
+    if code is not None:
+        ev["exit_code"] = code
+    if name == "open_pull_request" and ok:
+        mm = re.search(r"https://github\.com/\S+/pull/\d+", text)
+        if mm:
+            ev["url"] = mm.group(0)
+    return ev
+
+
+def todos_event(args: dict) -> dict:
+    return {"type": "todos", "items": [{"content": t.get("content", ""), "status": t.get("status", "pending")}
+                                       for t in (args or {}).get("todos", [])]}
+
+
+def pending_approvals(agent, cfg) -> list[dict]:
+    st = agent.get_state(cfg)
+    out = []
+    for it in st.interrupts or ():
+        v = it.value if isinstance(it.value, dict) else {}
+        acts = [{"name": a["name"], "kind": _kind(a["name"]), "title": _title(a["name"], a.get("args")),
+                 "args": _short_args(a.get("args"))} for a in v.get("action_requests", [])]
+        out.append({"type": "approval", "id": it.id, "actions": acts,
+                    "text": "Approve: " + "; ".join(f"{a['name']} ({a['title']})" for a in acts)})
+    return out
+
+
+# ---------------------------------------------------------------- history
+def history(tid: str, model_name: str) -> list[dict]:
+    st = agent_for(tid, model_name).get_state({"configurable": {"thread_id": tid}})
     out = []
     for msg in (st.values or {}).get("messages", []):
-        kind = msg.type  # human | ai | tool | system
+        kind = msg.type
         if kind == "human":
             out.append({"role": "user", "text": _text(msg.content)})
         elif kind == "ai":
-            for tc in getattr(msg, "tool_calls", None) or []:
-                out.append({"role": "tool_call", "name": tc["name"], "text": json.dumps(tc["args"])[:400]})
             t = _text(msg.content)
             if t.strip():
                 out.append({"role": "assistant", "text": t})
+            for tc in getattr(msg, "tool_calls", None) or []:
+                ev = call_event(tc)
+                out.append({"role": "tool_call", **{k: v for k, v in ev.items() if k != "type"}})
+                if tc["name"] == "write_todos":
+                    out.append({"role": "todos", "items": todos_event(tc.get("args"))["items"]})
         elif kind == "tool":
-            out.append({"role": "tool_result", "name": getattr(msg, "name", ""), "text": _text(msg.content)[:400]})
+            ev = result_event(msg)
+            out.append({"role": "tool_result", **{k: v for k, v in ev.items() if k != "type"}})
     return out
 
 
@@ -130,8 +239,94 @@ def thread_row(tid: str) -> dict | None:
     return dict(zip(("id", "title", "created", "updated", "model"), r)) if r else None
 
 
+# ---------------------------------------------------------------- streaming
+APPROVE_WORDS = {"approve", "approved", "yes", "y", "ok", "okay", "go", "ja", "do it", "👍"}
+
+
+def _stream(tid: str, row: dict, inp, lock: threading.Lock):
+    """Run one agent turn; yield NDJSON events. `inp` is a user text or a langgraph Command."""
+    from langgraph.types import Command
+
+    agent = agent_for(tid, row["model"])
+    cfg = {"configurable": {"thread_id": tid}, "recursion_limit": 300}
+    final: list[str] = []
+    try:
+        # middleware nodes may re-send the whole message list as an "update": emit each message once
+        seen = {getattr(m, "id", None) for m in (agent.get_state(cfg).values or {}).get("messages", [])}
+        if isinstance(inp, str):
+            pend = pending_approvals(agent, cfg)
+            if pend:  # plain-chat fallback: a typed "yes" approves, anything else rejects with that reason
+                ok = inp.strip().lower().rstrip("!.") in APPROVE_WORDS
+                inp = _decision_command(pend, "approve" if ok else "reject", None if ok else inp)
+            else:
+                inp = {"messages": [{"role": "user", "content": inp}]}
+        for mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]):
+            if mode == "messages":
+                chunk, meta = data
+                if chunk.type in ("AIMessageChunk", "ai") and meta.get("langgraph_node") == "model" \
+                        and "|" not in meta.get("langgraph_checkpoint_ns", ""):
+                    t = _text(chunk.content)
+                    if t:
+                        final.append(t)
+                        yield json.dumps({"type": "token", "text": t}) + "\n"
+            elif mode == "updates":
+                for node, upd in (data or {}).items():
+                    if not isinstance(upd, dict):
+                        continue
+                    msgs = upd.get("messages", []) or []
+                    for msg in msgs if isinstance(msgs, list) else [msgs]:
+                        mid = getattr(msg, "id", None)
+                        if mid is not None and mid in seen:
+                            continue
+                        seen.add(mid)
+                        if getattr(msg, "type", "") == "ai":
+                            for tc in getattr(msg, "tool_calls", None) or []:
+                                yield json.dumps(call_event(tc)) + "\n"
+                                if tc["name"] == "write_todos":
+                                    yield json.dumps(todos_event(tc.get("args"))) + "\n"
+                        elif getattr(msg, "type", "") == "tool":
+                            yield json.dumps(result_event(msg)) + "\n"
+        for ev in pending_approvals(agent, cfg):
+            yield json.dumps(ev) + "\n"
+        yield json.dumps({"type": "done", "text": "".join(final)}) + "\n"
+    except Exception as e:  # surface model/API errors to the app instead of a dead stream
+        yield json.dumps({"type": "error", "text": f"{type(e).__name__}: {e}"[:500]}) + "\n"
+    finally:
+        with DB_LOCK:
+            DB.execute("UPDATE pd_threads SET updated=? WHERE id=?", (now(), tid))
+            DB.commit()
+        lock.release()
+
+
+def _decision_command(pend: list[dict], decision: str, message: str | None):
+    from langgraph.types import Command
+    resume = {}
+    for p in pend:
+        d = {"type": decision}
+        if decision == "reject":
+            d["message"] = message or "Joern rejected this action."
+        resume[p["id"]] = {"decisions": [dict(d) for _ in p["actions"]]}
+    return Command(resume=resume)
+
+
+def _begin(tid: str) -> tuple[dict, threading.Lock]:
+    row = thread_row(tid)
+    if not row:
+        raise HTTPException(404, "no such thread")
+    lock = THREAD_LOCKS.setdefault(tid, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "this chat is still answering")
+    return row, lock
+
+
 # ---------------------------------------------------------------- API
-app = FastAPI(title="PaperDesk agent", version=VERSION)
+@asynccontextmanager
+async def _lifespan(_app):
+    threading.Thread(target=sandbox.reaper_loop, daemon=True).start()  # stops idle sandboxes
+    yield
+
+
+app = FastAPI(title="PaperDesk agent", version=VERSION, lifespan=_lifespan)
 
 
 def authed(request: Request) -> None:
@@ -150,6 +345,11 @@ class ChatIn(BaseModel):
     text: str
 
 
+class ResumeIn(BaseModel):
+    decision: str  # approve | reject
+    message: str | None = None
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     m = CONFIG["model"]
@@ -162,7 +362,8 @@ via {m['base_url']}</p><p>Chat from the PaperDesk app. API: <code>/api/agent/hea
 @app.get("/api/agent/health")
 def health():
     return {"ok": True, "version": VERSION, "model": CONFIG["model"]["name"],
-            "models": CONFIG["model"].get("choices", [CONFIG["model"]["name"]])}
+            "models": CONFIG["model"].get("choices", [CONFIG["model"]["name"]]),
+            "features": ["github_read", "sandbox", "pull_requests", "approvals"]}
 
 
 @app.get("/api/agent/threads", dependencies=[Depends(authed)])
@@ -185,11 +386,16 @@ def new_thread(body: NewThread):
 
 @app.delete("/api/agent/threads/{tid}", dependencies=[Depends(authed)])
 def delete_thread(tid: str):
+    if not re.fullmatch(r"[0-9a-f]{12}", tid):
+        raise HTTPException(400, "bad id")
     with DB_LOCK:
         DB.execute("DELETE FROM pd_threads WHERE id=?", (tid,))
         DB.commit()
+        for key in [k for k in AGENTS if k[0] == tid]:
+            AGENTS.pop(key)
     if CHECKPOINTER is not None:
         CHECKPOINTER.delete_thread(tid)
+    sandbox.destroy(tid)
     return {"ok": True}
 
 
@@ -198,65 +404,43 @@ def get_thread(tid: str):
     row = thread_row(tid)
     if not row:
         raise HTTPException(404, "no such thread")
-    return {**row, "messages": history(tid, row["model"])}
+    agent = agent_for(tid, row["model"])
+    return {**row, "messages": history(tid, row["model"]),
+            "pending_approvals": pending_approvals(agent, {"configurable": {"thread_id": tid}})}
 
 
 @app.post("/api/agent/threads/{tid}/chat", dependencies=[Depends(authed)])
 def chat(tid: str, body: ChatIn):
-    """Stream the answer as NDJSON lines:
-    {"type":"token","text"} | {"type":"tool_call","name","text"} | {"type":"tool_result","name","text"}
-    | {"type":"done","text"} | {"type":"error","text"}"""
-    row = thread_row(tid)
-    if not row:
-        raise HTTPException(404, "no such thread")
+    """NDJSON stream; event types: token, tool_call, tool_result, todos, approval, done, error.
+    While an approval is pending, a chat message answers it ("yes" approves, anything else rejects)."""
     if not body.text.strip():
         raise HTTPException(400, "empty message")
-    lock = THREAD_LOCKS.setdefault(tid, threading.Lock())
-    if not lock.acquire(blocking=False):
-        raise HTTPException(409, "this chat is still answering")
+    row, lock = _begin(tid)
     if row["title"] == "New chat":
         with DB_LOCK:
             DB.execute("UPDATE pd_threads SET title=? WHERE id=?", (body.text.strip()[:60], tid))
             DB.commit()
-
     return StreamingResponse(_stream(tid, row, body.text, lock), media_type="application/x-ndjson")
 
 
-def _stream(tid: str, row: dict, text: str, lock: threading.Lock):
-    if True:
-        agent = agent_for(row["model"])
-        cfg = {"configurable": {"thread_id": tid}, "recursion_limit": 60}
-        final = []
-        try:
-            for mode, data in agent.stream({"messages": [{"role": "user", "content": text}]},
-                                           cfg, stream_mode=["messages", "updates"]):
-                if mode == "messages":
-                    chunk, meta = data
-                    # only the main agent's model tokens, not sub-agents or tool output
-                    if chunk.type in ("AIMessageChunk", "ai") and meta.get("langgraph_node") == "model" \
-                            and not meta.get("langgraph_checkpoint_ns", "").count("|"):
-                        t = _text(chunk.content)
-                        if t:
-                            final.append(t)
-                            yield json.dumps({"type": "token", "text": t}) + "\n"
-                elif mode == "updates":
-                    for node, upd in (data or {}).items():
-                        for msg in (upd or {}).get("messages", []) if isinstance(upd, dict) else []:
-                            if getattr(msg, "type", "") == "ai":
-                                for tc in getattr(msg, "tool_calls", None) or []:
-                                    yield json.dumps({"type": "tool_call", "name": tc["name"],
-                                                      "text": json.dumps(tc["args"])[:400]}) + "\n"
-                            elif getattr(msg, "type", "") == "tool":
-                                yield json.dumps({"type": "tool_result", "name": getattr(msg, "name", ""),
-                                                  "text": _text(msg.content)[:400]}) + "\n"
-            yield json.dumps({"type": "done", "text": "".join(final)}) + "\n"
-        except Exception as e:  # surface model/API errors to the app instead of a dead stream
-            yield json.dumps({"type": "error", "text": f"{type(e).__name__}: {e}"[:500]}) + "\n"
-        finally:
-            with DB_LOCK:
-                DB.execute("UPDATE pd_threads SET updated=? WHERE id=?", (now(), tid))
-                DB.commit()
-            lock.release()
+@app.post("/api/agent/threads/{tid}/resume", dependencies=[Depends(authed)])
+def resume(tid: str, body: ResumeIn):
+    """Answer the pending approval(s) of a chat; streams the continuation like /chat."""
+    if body.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision must be approve or reject")
+    row, lock = _begin(tid)
+    try:
+        pend = pending_approvals(agent_for(tid, row["model"]), {"configurable": {"thread_id": tid}})
+    except Exception:
+        lock.release()
+        raise
+    if not pend:
+        lock.release()
+        raise HTTPException(409, "nothing to approve")
+    cmd = _decision_command(pend, body.decision, body.message)
+    return StreamingResponse(_stream(tid, row, cmd, lock), media_type="application/x-ndjson")
+
+
 
 
 def main():
@@ -264,26 +448,31 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8800)
-    c = sub.add_parser("chat", help="one-shot terminal chat for testing")
+    c = sub.add_parser("chat", help="one-shot terminal chat for testing (no auth)")
     c.add_argument("text")
     c.add_argument("--thread", default=None)
+    c.add_argument("--model", default=None)
     a = ap.parse_args()
     if a.cmd == "serve":
         import uvicorn
         uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="info")
-    else:
-        tid = a.thread or new_thread(NewThread())["id"]
-        t0 = time.time()
-        row = thread_row(tid)
-        lock = THREAD_LOCKS.setdefault(tid, threading.Lock())
-        lock.acquire()
-        for line in _stream(tid, row, a.text, lock):
-            ev = json.loads(line)
-            if ev["type"] == "token":
-                print(ev["text"], end="", flush=True)
-            elif ev["type"] != "done":
-                print(f"\n[{ev['type']}] {ev.get('name', '')} {ev['text']}")
-        print(f"\n-- thread {tid}, {time.time() - t0:.1f}s")
+        return
+    tid = a.thread or new_thread(NewThread(model=a.model))["id"]
+    row, lock = _begin(tid)
+    t0 = time.time()
+    for line in _stream(tid, row, a.text, lock):
+        ev = json.loads(line)
+        if ev["type"] == "token":
+            print(ev["text"], end="", flush=True)
+        elif ev["type"] == "tool_call":
+            print(f"\n[{ev['kind']}] {ev['name']}: {ev['title']}")
+        elif ev["type"] == "tool_result":
+            print(f"  -> {'ok' if ev['ok'] else 'FAIL'} {ev['text'][:200]!r}")
+        elif ev["type"] == "todos":
+            print("  todos: " + " | ".join(f"[{i['status']}] {i['content']}" for i in ev["items"]))
+        elif ev["type"] in ("approval", "error"):
+            print(f"\n[{ev['type'].upper()}] {ev['text']}")
+    print(f"\n-- thread {tid}, {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":

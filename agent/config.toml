@@ -1,9 +1,18 @@
 # PaperDesk agent model config. Any OpenAI-compatible endpoint works.
 # Testing: ScaDS.AI (TU Dresden, free, shared daily cap ~1500 req -- the paper studies use it too).
 [model]
-name = "openai/gpt-oss-120b"
+# DeepSeek did the full code -> test -> PR flow on 2026-11-09; gpt-oss and GLM-5.3-Flash stalled on it
+name = "deepseek-ai/DeepSeek-V4.1-Flash"
 base_url = "https://llm.scads.ai/v1"
 api_key_env = "SCADS_API_KEY"
 temperature = 0.3
 timeout = 120
-choices = ["openai/gpt-oss-120b", "zai-org/GLM-5.3-Flash", "deepseek-ai/DeepSeek-V4.1-Flash", "mistralai/Mistral-Large-4"]
+choices = ["deepseek-ai/DeepSeek-V4.1-Flash", "openai/gpt-oss-120b", "zai-org/GLM-5.3-Flash", "mistralai/Mistral-Large-4"]
+
+[github]
+# writes (comment, issue, clone + PR) only for these owners; every write needs Joern's approval
+write_owners = ["joernmht"]
+# never read or touch: EBL lab software is not to be handled by the agent
+deny = ["joernmht/ebl"]
+author_name = "Joern Maurischat"
+author_email = "joern.maurischat@tu-dresden.de"
