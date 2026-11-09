@@ -329,8 +329,8 @@ def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
 def workspace(tid: str) -> list[dict]:
     m = _meta(tid) if ws_dir(tid).exists() else {}
     out = [{**v, "mode": "write"} for v in m.get("repos", {}).values()]
-    return out + [{k: v for k, v in r.items() if k not in ("box_path", "masked")}
-                  for r in m.get("readonly", {}).values()]
+    # `masked` = relative paths of blanked secret files (names only, never contents)
+    return out + [{k: v for k, v in r.items() if k != "box_path"} for r in m.get("readonly", {}).values()]
 
 
 def detach(tid: str, name: str) -> None:
