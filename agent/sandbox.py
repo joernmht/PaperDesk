@@ -30,6 +30,7 @@ DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 1200
 MAX_RUNNING = 3
 IDLE_STOP_S = 1800
+LAYOUT = "2"  # container layout version: 2 = /workspace (rw) + /workspace/ro (read-only repos)
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SAFE_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true"]
 
@@ -61,19 +62,30 @@ def ensure_container(tid: str) -> str:
         st = _state(name)
         if st != "running":
             _make_room(tid)
+        if st is not None and _label(name, "pda.v") != LAYOUT:  # older layout (no read-only mount): recreate
+            _run(["docker", "rm", "-f", name], timeout=60)
+            st = None
         if st is None:
             work = ws_dir(tid) / "work"
+            ro = ws_dir(tid) / "ro"
             (work / ".home").mkdir(parents=True, exist_ok=True)
-            r = _run(["docker", "run", "-d", "--name", name, "--label", "pda=1", "--user", "1000:1000",
+            ro.mkdir(parents=True, exist_ok=True)
+            r = _run(["docker", "run", "-d", "--name", name, "--label", "pda=1", "--label", f"pda.v={LAYOUT}",
+                      "--user", "1000:1000",
                       "--memory", "2g", "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "512",
                       "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                      "-v", f"{work}:/workspace", IMAGE], timeout=60)
+                      "-v", f"{work}:/workspace", "-v", f"{ro}:/workspace/ro:ro", IMAGE], timeout=60)
             if r.returncode:
                 raise RuntimeError(f"sandbox start failed: {r.stderr.decode()[:300]}")
         elif st != "running":
             _run(["docker", "start", name], timeout=60)
         LAST_USE[tid] = time.time()
     return name
+
+
+def _label(name: str, key: str) -> str:
+    r = _run(["docker", "inspect", "-f", f'{{{{index .Config.Labels "{key}"}}}}', name], timeout=20)
+    return r.stdout.decode().strip()
 
 
 def _make_room(tid: str) -> None:
@@ -179,6 +191,8 @@ def clone_into_sandbox(tid: str, repo: str, base_branch: str | None, identity: t
     m = _meta(tid) if ws_dir(tid).exists() else {"repos": {}}
     if name in m["repos"]:
         return {"already": True, **m["repos"][name]}
+    if name in m.get("readonly", {}):
+        raise RuntimeError(f"{name} is attached read-only in this chat; a writable copy needs a new chat")
     pristine = ws_dir(tid) / "pristine" / name
     pristine.parent.mkdir(parents=True, exist_ok=True)
     args = [*SAFE_GIT, "clone", "--single-branch", "--no-tags"]
@@ -202,17 +216,51 @@ def clone_into_sandbox(tid: str, repo: str, base_branch: str | None, identity: t
     r = dexec(tid, ["sh", "-c", script, "sh", identity[0], identity[1], base, name, branch], timeout=300)
     if r.returncode:
         raise RuntimeError(f"sandbox clone failed: {(r.stdout + r.stderr).decode()[-300:]}")
-    info = {"repo": repo, "dir": f"/workspace/{name}", "base_branch": base, "base_sha": sha, "branch": branch}
+    info = {"repo": repo, "dir": f"/workspace/{name}", "mode": "write", "base_branch": base, "base_sha": sha,
+            "branch": branch}
     m["repos"][name] = info
     _save_meta(tid, m)
     return info
+
+
+def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
+    """Shallow host-side clone into <ws>/ro/<name>, which the container sees READ-ONLY at /workspace/ro/<name>.
+    The container cannot write there, so the host may safely run git in it (clone/refresh)."""
+    name = repo.split("/")[1]
+    m = _meta(tid) if ws_dir(tid).exists() else {"repos": {}}
+    ro = m.setdefault("readonly", {})
+    dest = ws_dir(tid) / "ro" / name
+    if name in m.get("repos", {}):
+        return {**m["repos"][name], "note": "already attached writable at /workspace/" + name}
+    if name in ro:  # refresh to the latest state of the branch
+        r = _run([*SAFE_GIT, "-C", str(dest), "pull", "-q", "--ff-only", "--depth", "1"], timeout=600)
+        return {**ro[name], "refreshed": r.returncode == 0}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    args = [*SAFE_GIT, "clone", "-q", "--depth", "1", "--single-branch", "--no-tags"]
+    if ref:
+        args += ["--branch", ref]
+    r = _run([*args, f"git@github.com:{repo}.git", str(dest)], timeout=900)
+    if r.returncode:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RuntimeError(f"clone failed: {r.stderr.decode()[-300:]}")
+    branch = _run([*SAFE_GIT, "-C", str(dest), "rev-parse", "--abbrev-ref", "HEAD"]).stdout.decode().strip()
+    info = {"repo": repo, "dir": f"/workspace/ro/{name}", "mode": "read", "branch": branch}
+    ro[name] = info
+    _save_meta(tid, m)
+    return info
+
+
+def workspace(tid: str) -> list[dict]:
+    m = _meta(tid) if ws_dir(tid).exists() else {}
+    out = [{**v, "mode": "write"} for v in m.get("repos", {}).values()]
+    return out + list(m.get("readonly", {}).values())
 
 
 def export_commits(tid: str, name: str) -> dict:
     """Bundle the agent's commits out of the container into the pristine clone; return a review summary."""
     m = _meta(tid)
     if name not in m["repos"]:
-        raise RuntimeError(f"no cloned repo '{name}' in this chat; call clone_repo first")
+        raise RuntimeError(f"'{name}' is not a writable repo in this chat (read-only repos cannot be PR'd)")
     info = m["repos"][name]
     d = info["dir"]
     st = dexec(tid, ["git", "-C", d, "status", "--porcelain"], timeout=60).stdout.decode().strip()

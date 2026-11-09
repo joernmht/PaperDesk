@@ -39,7 +39,7 @@ DIR = Path(__file__).resolve().parent
 STATE = HOME / ".local/state/paperdesk"
 DB_PATH = STATE / "agent.sqlite"
 TOKEN_FILE = HOME / ".config/paperdesk/token"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 CONFIG = tomllib.loads((DIR / "config.toml").read_text())
 POLICY = ghtools.Policy(CONFIG.get("github", {}))
@@ -57,8 +57,13 @@ For multi-step work, plan with write_todos and keep it updated.
 
 GitHub: use the github_* tools to read repos, issues, PRs, files and CI runs.
 
+Repos in this chat: WRITABLE ones live at /workspace/<name> on a work branch (only these can become a PR);
+READ-ONLY ones at /workspace/ro/<name> (reference material; you cannot change them). Attach more
+reference repos yourself with clone_repo_readonly. Need to change a repo that is not writable yet?
+Call clone_repo_writable (Joern approves). list_workspace shows what is attached.
+
 Coding workflow (when asked to change code):
-1. clone_repo("joernmht/<name>") -> the repo appears at /workspace/<name> on a work branch.
+1. Make sure the repo is attached writable (see the list below, or clone_repo_writable).
 2. Read the code, make focused changes, follow the repo's style and its CLAUDE.md/README if present.
 3. Test in a virtual environment OUTSIDE the repo dir, e.g.
    python -m venv /workspace/.venvs/<name> && . /workspace/.venvs/<name>/bin/activate && pip install -e '.[test]'
@@ -83,6 +88,8 @@ def _conn() -> sqlite3.Connection:
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("""CREATE TABLE IF NOT EXISTS pd_threads(
         id TEXT PRIMARY KEY, title TEXT, created TEXT, updated TEXT, model TEXT)""")
+    if "repos" not in [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]:
+        c.execute("ALTER TABLE pd_threads ADD COLUMN repos TEXT DEFAULT '[]'")  # chat setup: [{repo, mode}]
     c.commit()
     return c
 
@@ -106,8 +113,19 @@ def build_agent(tid: str, model_name: str):
     # files + shell in the chat's container; offloaded context stays in the checkpointed state
     backend = CompositeBackend(default=sandbox.DockerSandbox(tid), routes={"/_agent/": StateBackend()},
                                artifacts_root="/_agent")
-    return create_deep_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, backend=backend,
+    ws = sandbox.workspace(tid)
+    prompt = SYSTEM_PROMPT + "\n\nAttached now:\n" + ("\n".join(
+        f"- {r['repo']} at {r['dir']} ({'WRITABLE, branch ' + r['branch'] if r['mode'] == 'write' else 'read-only'})"
+        for r in ws) or "- nothing yet")
+    return create_deep_agent(model=llm, tools=tools, system_prompt=prompt, backend=backend,
                              interrupt_on=interrupt_on, checkpointer=CHECKPOINTER)
+
+
+def forget_agent(tid: str) -> None:
+    """Drop cached agents of a chat (its system prompt lists the attached repos)."""
+    with DB_LOCK:
+        for key in [k for k in AGENTS if k[0] == tid]:
+            AGENTS.pop(key)
 
 
 def agent_for(tid: str, model_name: str):
@@ -127,7 +145,8 @@ def agent_for(tid: str, model_name: str):
 
 # ---------------------------------------------------------------- event shaping (app boxes)
 FILE_TOOLS = {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete_file"}
-GIT_TOOLS = {"clone_repo", "review_changes", "open_pull_request"}
+GIT_TOOLS = {"clone_repo_readonly", "clone_repo_writable", "list_workspace", "review_changes",
+             "open_pull_request", "attach_repo"}
 
 
 def _text(content) -> str:
@@ -212,6 +231,28 @@ def pending_approvals(agent, cfg) -> list[dict]:
 
 
 # ---------------------------------------------------------------- history
+def turns(rows: list[dict]) -> list[dict]:
+    """Group history rows per user message: steps (tool boxes + in-between narration) and the final answer."""
+    out: list[dict] = []
+    for r in rows:
+        if r["role"] == "user":
+            out.append({"user": r["text"], "steps": [], "answer": None})
+            continue
+        if not out:
+            out.append({"user": None, "steps": [], "answer": None})
+        t = out[-1]
+        if r["role"] == "assistant":
+            if t["answer"] is not None:  # an earlier text was narration before more tool calls
+                t["steps"].append({"role": "narration", "text": t["answer"]})
+            t["answer"] = r["text"]
+        else:
+            if t["answer"] is not None:
+                t["steps"].append({"role": "narration", "text": t["answer"]})
+                t["answer"] = None
+            t["steps"].append(r)
+    return out
+
+
 def history(tid: str, model_name: str) -> list[dict]:
     st = agent_for(tid, model_name).get_state({"configurable": {"thread_id": tid}})
     out = []
@@ -234,9 +275,47 @@ def history(tid: str, model_name: str) -> list[dict]:
     return out
 
 
+COLS = ("id", "title", "created", "updated", "model", "repos")
+
+
+def _row(r) -> dict:
+    d = dict(zip(COLS, r))
+    d["repos"] = json.loads(d.get("repos") or "[]")
+    return d
+
+
 def thread_row(tid: str) -> dict | None:
-    r = DB.execute("SELECT id,title,created,updated,model FROM pd_threads WHERE id=?", (tid,)).fetchone()
-    return dict(zip(("id", "title", "created", "updated", "model"), r)) if r else None
+    r = DB.execute(f"SELECT {','.join(COLS)} FROM pd_threads WHERE id=?", (tid,)).fetchone()
+    return _row(r) if r else None
+
+
+def attach(tid: str, repo: str, mode: str) -> dict:
+    """Joern-initiated attach (chat setup or the app's repo picker): his choice is the approval."""
+    if mode == "write":
+        info = sandbox.clone_into_sandbox(tid, POLICY.check(repo, write=True), None, POLICY.identity)
+    else:
+        info = sandbox.clone_readonly(tid, POLICY.check(repo), None)
+    forget_agent(tid)
+    return info
+
+
+def attach_pending(tid: str, row: dict):
+    """Clone the repos chosen at chat setup that are not attached yet; yield box events."""
+    have = {r["repo"].lower() for r in sandbox.workspace(tid)}
+    for i, spec in enumerate(row.get("repos") or []):
+        if spec["repo"].lower() in have:
+            continue
+        cid = f"attach-{i}"
+        args = {"repo": spec["repo"], "mode": spec["mode"]}
+        yield {"type": "tool_call", "id": cid, "name": "attach_repo", "kind": "git",
+               "title": f"{spec['repo']} ({spec['mode']})", "args": args, "text": json.dumps(args)}
+        try:
+            info = attach(tid, spec["repo"], spec["mode"])
+            yield {"type": "tool_result", "id": cid, "name": "attach_repo", "kind": "git", "ok": True,
+                   "text": json.dumps(info)}
+        except Exception as e:
+            yield {"type": "tool_result", "id": cid, "name": "attach_repo", "kind": "git", "ok": False,
+                   "text": f"ERROR: {e}"[:500]}
 
 
 # ---------------------------------------------------------------- streaming
@@ -247,10 +326,13 @@ def _stream(tid: str, row: dict, inp, lock: threading.Lock):
     """Run one agent turn; yield NDJSON events. `inp` is a user text or a langgraph Command."""
     from langgraph.types import Command
 
-    agent = agent_for(tid, row["model"])
     cfg = {"configurable": {"thread_id": tid}, "recursion_limit": 300}
     final: list[str] = []
+    seg = None  # id of the model message whose tokens are streaming
     try:
+        for ev in attach_pending(tid, row):
+            yield json.dumps(ev) + "\n"
+        agent = agent_for(tid, row["model"])
         # middleware nodes may re-send the whole message list as an "update": emit each message once
         seen = {getattr(m, "id", None) for m in (agent.get_state(cfg).values or {}).get("messages", [])}
         if isinstance(inp, str):
@@ -267,8 +349,10 @@ def _stream(tid: str, row: dict, inp, lock: threading.Lock):
                         and "|" not in meta.get("langgraph_checkpoint_ns", ""):
                     t = _text(chunk.content)
                     if t:
+                        if chunk.id != seg:
+                            seg, final = chunk.id, []
                         final.append(t)
-                        yield json.dumps({"type": "token", "text": t}) + "\n"
+                        yield json.dumps({"type": "token", "text": t, "seg": seg}) + "\n"
             elif mode == "updates":
                 for node, upd in (data or {}).items():
                     if not isinstance(upd, dict):
@@ -280,6 +364,12 @@ def _stream(tid: str, row: dict, inp, lock: threading.Lock):
                             continue
                         seen.add(mid)
                         if getattr(msg, "type", "") == "ai":
+                            if getattr(msg, "tool_calls", None):
+                                # text streamed before these tool calls was narration, not the answer
+                                if _text(msg.content).strip():
+                                    yield json.dumps({"type": "segment", "seg": mid, "final": False}) + "\n"
+                                if mid == seg:
+                                    final = []
                             for tc in getattr(msg, "tool_calls", None) or []:
                                 yield json.dumps(call_event(tc)) + "\n"
                                 if tc["name"] == "write_todos":
@@ -336,9 +426,15 @@ def authed(request: Request) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+class RepoSpec(BaseModel):
+    repo: str
+    mode: str = "read"  # read | write
+
+
 class NewThread(BaseModel):
     title: str | None = None
     model: str | None = None
+    repos: list[RepoSpec] = []
 
 
 class ChatIn(BaseModel):
@@ -368,8 +464,45 @@ def health():
 
 @app.get("/api/agent/threads", dependencies=[Depends(authed)])
 def list_threads():
-    rows = DB.execute("SELECT id,title,created,updated,model FROM pd_threads ORDER BY updated DESC LIMIT 100").fetchall()
-    return {"threads": [dict(zip(("id", "title", "created", "updated", "model"), r)) for r in rows]}
+    rows = DB.execute(f"SELECT {','.join(COLS)} FROM pd_threads ORDER BY updated DESC LIMIT 100").fetchall()
+    return {"threads": [_row(r) for r in rows]}
+
+
+_REPO_CACHE: dict = {"t": 0.0, "repos": []}
+
+
+@app.get("/api/agent/repos", dependencies=[Depends(authed)])
+def repo_choices():
+    """Repos for the app's picker: Joern's GitHub repos minus the deny list (cached 10 min)."""
+    if time.time() - _REPO_CACHE["t"] > 600:
+        raw = json.loads(ghtools._gh("repo", "list", POLICY.default_owner, "--limit", "200", "--json",
+                                     "nameWithOwner,description,visibility,pushedAt,isArchived"))
+        _REPO_CACHE.update(t=time.time(), repos=sorted(
+            ({"repo": r["nameWithOwner"], "description": r.get("description") or "",
+              "private": r["visibility"] != "PUBLIC", "pushed": r["pushedAt"],
+              "writable": r["nameWithOwner"].split("/")[0].lower() in POLICY.write_owners}
+             for r in raw if r["nameWithOwner"].lower() not in POLICY.deny and not r.get("isArchived")),
+            key=lambda r: r["pushed"], reverse=True))
+    return {"repos": _REPO_CACHE["repos"]}
+
+
+@app.post("/api/agent/threads/{tid}/repos", dependencies=[Depends(authed)])
+def add_repo(tid: str, body: RepoSpec):
+    """Attach a repo to an existing chat now (read-only, or writable = Joern's own approval)."""
+    if body.mode not in ("read", "write"):
+        raise HTTPException(400, "mode must be read or write")
+    row, lock = _begin(tid)
+    try:
+        info = attach(tid, body.repo, body.mode)
+        with DB_LOCK:
+            specs = row["repos"] + [{"repo": info["repo"], "mode": body.mode}]
+            DB.execute("UPDATE pd_threads SET repos=? WHERE id=?", (json.dumps(specs), tid))
+            DB.commit()
+        return {"attached": info, "workspace": sandbox.workspace(tid)}
+    except (ValueError, PermissionError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    finally:
+        lock.release()
 
 
 @app.post("/api/agent/threads", dependencies=[Depends(authed)])
@@ -377,11 +510,20 @@ def new_thread(body: NewThread):
     model = body.model or CONFIG["model"]["name"]
     if model not in CONFIG["model"].get("choices", [CONFIG["model"]["name"]]):
         raise HTTPException(400, f"unknown model {model}")
+    specs = []
+    for r in body.repos:
+        if r.mode not in ("read", "write"):
+            raise HTTPException(400, f"mode must be read or write: {r.repo}")
+        try:
+            specs.append({"repo": POLICY.check(r.repo, write=r.mode == "write"), "mode": r.mode})
+        except (ValueError, PermissionError) as e:
+            raise HTTPException(400, str(e))
     tid = uuid.uuid4().hex[:12]
     with DB_LOCK:
-        DB.execute("INSERT INTO pd_threads VALUES(?,?,?,?,?)", (tid, body.title or "New chat", now(), now(), model))
+        DB.execute(f"INSERT INTO pd_threads({','.join(COLS)}) VALUES(?,?,?,?,?,?)",
+                   (tid, body.title or "New chat", now(), now(), model, json.dumps(specs)))
         DB.commit()
-    return thread_row(tid)
+    return thread_row(tid)  # repos are cloned when the first message runs (shown as attach_repo boxes)
 
 
 @app.delete("/api/agent/threads/{tid}", dependencies=[Depends(authed)])
@@ -391,8 +533,7 @@ def delete_thread(tid: str):
     with DB_LOCK:
         DB.execute("DELETE FROM pd_threads WHERE id=?", (tid,))
         DB.commit()
-        for key in [k for k in AGENTS if k[0] == tid]:
-            AGENTS.pop(key)
+    forget_agent(tid)
     if CHECKPOINTER is not None:
         CHECKPOINTER.delete_thread(tid)
     sandbox.destroy(tid)
@@ -405,7 +546,8 @@ def get_thread(tid: str):
     if not row:
         raise HTTPException(404, "no such thread")
     agent = agent_for(tid, row["model"])
-    return {**row, "messages": history(tid, row["model"]),
+    msgs = history(tid, row["model"])
+    return {**row, "messages": msgs, "turns": turns(msgs), "workspace": sandbox.workspace(tid),
             "pending_approvals": pending_approvals(agent, {"configurable": {"thread_id": tid}})}
 
 
@@ -452,12 +594,14 @@ def main():
     c.add_argument("text")
     c.add_argument("--thread", default=None)
     c.add_argument("--model", default=None)
+    c.add_argument("--repo", action="append", default=[], help="owner/name[:write] (repeatable)")
     a = ap.parse_args()
     if a.cmd == "serve":
         import uvicorn
         uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="info")
         return
-    tid = a.thread or new_thread(NewThread(model=a.model))["id"]
+    specs = [RepoSpec(repo=r.split(":")[0], mode="write" if r.endswith(":write") else "read") for r in a.repo]
+    tid = a.thread or new_thread(NewThread(model=a.model, repos=specs))["id"]
     row, lock = _begin(tid)
     t0 = time.time()
     for line in _stream(tid, row, a.text, lock):

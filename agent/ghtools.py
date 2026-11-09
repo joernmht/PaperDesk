@@ -181,15 +181,31 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
 
     # ---------------------------------------------------------- code in the sandbox
     @tool
-    def clone_repo(repo: str, base_branch: str = "") -> str:
-        """Clone one of Joern's GitHub repos into this chat's sandbox at /workspace/<name>, on a
-        fresh work branch. Then edit, test and `git commit` there with the execute tool."""
+    def clone_repo_readonly(repo: str, ref: str = "") -> str:
+        """Attach a GitHub repo READ-ONLY at /workspace/ro/<name> (latest commit of its default branch, or
+        `ref`). Use it for reference material: style guides, templates, other code. You cannot change it.
+        Calling it again refreshes the copy."""
+        try:
+            repo = policy.check(repo)
+            return json.dumps(sandbox.clone_readonly(tid, repo, ref or None))
+        except Exception as e:
+            return _err(e)
+
+    @tool
+    def clone_repo_writable(repo: str, base_branch: str = "") -> str:
+        """Attach one of Joern's repos WRITABLE at /workspace/<name> on a fresh work branch, for changes
+        that end in a pull request. Needs Joern's approval; skip it if the repo is already attached writable."""
         try:
             repo = policy.check(repo, write=True)
             info = sandbox.clone_into_sandbox(tid, repo, base_branch or None, policy.identity)
-            return json.dumps(info) + ("\n(already cloned in this chat)" if info.get("already") else "")
+            return json.dumps(info) + ("\n(already attached in this chat)" if info.get("already") else "")
         except Exception as e:
             return _err(e)
+
+    @tool
+    def list_workspace() -> str:
+        """List the repos attached to this chat with their path and mode (write | read)."""
+        return json.dumps(sandbox.workspace(tid)) or "[]"
 
     @tool
     def review_changes(repo_dir_name: str) -> str:
@@ -207,7 +223,7 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
         try:
             m = sandbox._meta(tid)["repos"].get(repo_dir_name)
             if not m:
-                raise RuntimeError(f"no cloned repo '{repo_dir_name}' in this chat")
+                raise RuntimeError(f"'{repo_dir_name}' is not a writable repo in this chat")
             policy.check(m["repo"], write=True)
             res = sandbox.push_and_pr(tid, repo_dir_name, title, body + "\n\n---\n🤖 Opened by the PaperDesk "
                                       "agent (code written and tested in its sandbox) on Joern's approval.", draft)
@@ -217,7 +233,8 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
 
     tools = [github_list_repos, github_repo, github_issues, github_issue, github_prs, github_pr,
              github_read_file, github_ci_runs, github_comment, github_create_issue,
-             clone_repo, review_changes, open_pull_request]
+             clone_repo_readonly, clone_repo_writable, list_workspace, review_changes, open_pull_request]
     gate = {"allowed_decisions": ["approve", "reject"]}
-    interrupt_on = {"github_comment": gate, "github_create_issue": gate, "open_pull_request": gate}
+    interrupt_on = {"github_comment": gate, "github_create_issue": gate, "open_pull_request": gate,
+                    "clone_repo_writable": gate}
     return tools, interrupt_on
