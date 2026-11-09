@@ -1,7 +1,8 @@
 """GitHub tools for the PaperDesk agent (host-side, via the box's `gh` login).
 
 Read tools work on any repo the login can see, except the deny list. Write tools (comment, issue,
-pull request) are limited to `write_owners`, and agentd gates every one behind Joern's approval.
+writable clone, pull request) are limited to `write_owners`; in "ask" chats agentd gates them behind
+Joern's approval, in "auto" chats (the default) they run directly.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from langchain_core.tools import tool
 import sandbox
 
 MAX = 20_000
+GATED = {"github_comment", "github_create_issue", "open_pull_request", "clone_repo_writable"}
 
 
 class Policy:
@@ -158,11 +160,11 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
     # ---------------------------------------------------------- writes (approval-gated)
     @tool
     def github_comment(repo: str, number: int, body: str) -> str:
-        """Post a comment on an issue or pull request. Needs Joern's approval."""
+        """Post a comment on an issue or pull request."""
         try:
             repo = policy.check(repo, write=True)
             out = _gh("api", f"repos/{repo}/issues/{int(number)}/comments", "-f",
-                      f"body={body}\n\n<sub>Posted by the PaperDesk agent on Joern's approval.</sub>",
+                      f"body={body}\n\n<sub>Posted by the PaperDesk agent for Joern.</sub>",
                       "--jq", ".html_url")
             return f"Comment posted: {out.strip()}"
         except Exception as e:
@@ -170,11 +172,11 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
 
     @tool
     def github_create_issue(repo: str, title: str, body: str) -> str:
-        """Open a new issue. Needs Joern's approval."""
+        """Open a new issue."""
         try:
             repo = policy.check(repo, write=True)
             out = _gh("issue", "create", "-R", repo, "--title", title, "--body",
-                      body + "\n\n<sub>Opened by the PaperDesk agent on Joern's approval.</sub>")
+                      body + "\n\n<sub>Opened by the PaperDesk agent for Joern.</sub>")
             return f"Issue opened: {out.strip().splitlines()[-1]}"
         except Exception as e:
             return _err(e)
@@ -194,7 +196,7 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
     @tool
     def clone_repo_writable(repo: str, base_branch: str = "") -> str:
         """Attach one of Joern's repos WRITABLE at /workspace/<name> on a fresh work branch, for changes
-        that end in a pull request. Needs Joern's approval; skip it if the repo is already attached writable."""
+        that end in a pull request. Skip it if the repo is already attached writable."""
         try:
             repo = policy.check(repo, write=True)
             info = sandbox.clone_into_sandbox(tid, repo, base_branch or None, policy.identity)
@@ -219,14 +221,14 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
     @tool
     def open_pull_request(repo_dir_name: str, title: str, body: str, draft: bool = True) -> str:
         """Push the committed work branch of /workspace/<repo_dir_name> to GitHub and open (or update)
-        a pull request. Needs Joern's approval. Commit everything first; changes to .github/ are refused."""
+        a draft pull request. Commit everything first; changes to .github/ are refused."""
         try:
             m = sandbox._meta(tid)["repos"].get(repo_dir_name)
             if not m:
                 raise RuntimeError(f"'{repo_dir_name}' is not a writable repo in this chat")
             policy.check(m["repo"], write=True)
             res = sandbox.push_and_pr(tid, repo_dir_name, title, body + "\n\n---\n🤖 Opened by the PaperDesk "
-                                      "agent (code written and tested in its sandbox) on Joern's approval.", draft)
+                                      "agent for Joern (code written and tested in its sandbox).", draft)
             return json.dumps({k: res[k] for k in ("url", "updated", "branch", "stat", "commits")})
         except Exception as e:
             return _err(e)
@@ -235,6 +237,5 @@ def make_tools(tid: str, policy: Policy) -> tuple[list, dict]:
              github_read_file, github_ci_runs, github_comment, github_create_issue,
              clone_repo_readonly, clone_repo_writable, list_workspace, review_changes, open_pull_request]
     gate = {"allowed_decisions": ["approve", "reject"]}
-    interrupt_on = {"github_comment": gate, "github_create_issue": gate, "open_pull_request": gate,
-                    "clone_repo_writable": gate}
+    interrupt_on = {name: gate for name in GATED}
     return tools, interrupt_on

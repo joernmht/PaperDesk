@@ -12,7 +12,10 @@ Trust model
 """
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -30,7 +33,16 @@ DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 1200
 MAX_RUNNING = 3
 IDLE_STOP_S = 1800
-LAYOUT = "2"  # container layout version: 2 = /workspace (rw) + /workspace/ro (read-only repos)
+LAYOUT = "3"  # 2 = /workspace (rw) + /workspace/ro; 3 = + live box checkouts bind-mounted read-only
+# Box checkouts that may be mounted read-only into a sandbox (GitHub remotes only; Overleaf repos carry
+# tokens in their URLs and never match). Scanned at depth 1.
+CHECKOUT_ROOTS = [Path.home(), Path("/vol/home")]
+# Files inside a mounted checkout that are covered with an empty /dev/null (git-ignored secrets etc.).
+SECRET_GLOBS = [".env", "*.env", ".env.local", ".env.*.local", "secrets*", "*.pem", "*.key", "id_rsa*",
+                "id_ed25519*", ".netrc", "*.keystore", "*.jks", "*.p12", "local.properties", ".pin",
+                "credentials", "credentials.json", "*.token", "token", "*apikey*"]
+PRUNE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".dvc", ".gradle", "build"}
+_LOCAL: dict = {"t": 0.0, "map": {}}
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SAFE_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true"]
 
@@ -55,26 +67,75 @@ def _state(name: str) -> str | None:
     return r.stdout.decode().strip() if r.returncode == 0 else None
 
 
+def local_checkouts() -> dict[str, str]:
+    """{'owner/name' (lowercase): '/abs/path'} for git checkouts on the box with a GitHub origin (cached 10 min)."""
+    if time.time() - _LOCAL["t"] < 600:
+        return _LOCAL["map"]
+    found: dict[str, str] = {}
+    for root in CHECKOUT_ROOTS:
+        try:
+            dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink())
+        except OSError:
+            continue
+        for d in dirs:
+            if not (d / ".git").is_dir():
+                continue
+            r = _run(["git", "-C", str(d), "config", "--get", "remote.origin.url"], timeout=10)
+            m = re.match(r"^(?:git@github\.com:|https://github\.com/)([^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+                         r.stdout.decode().strip())
+            if m and "@" not in m.group(1):
+                found.setdefault(m.group(1).lower(), str(d))
+    _LOCAL.update(t=time.time(), map=found)
+    return found
+
+
+def _secret_files(root: str) -> list[str]:
+    out = []
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in PRUNE_DIRS]
+        for f in fns:
+            if not f.endswith(".example") and any(fnmatch.fnmatch(f.lower(), g) for g in SECRET_GLOBS):
+                out.append(os.path.relpath(os.path.join(dp, f), root))
+    return out
+
+
+def _mount_args(tid: str) -> list[str]:
+    work, ro = ws_dir(tid) / "work", ws_dir(tid) / "ro"
+    args = ["-v", f"{work}:/workspace", "-v", f"{ro}:/workspace/ro:ro"]
+    m = _meta(tid) if ws_dir(tid).exists() else {}
+    for name, info in sorted(m.get("readonly", {}).items()):
+        src = info.get("box_path")
+        if not src:
+            continue
+        (ro / name).mkdir(parents=True, exist_ok=True)  # mountpoint inside the read-only dir
+        args += ["-v", f"{src}:/workspace/ro/{name}:ro"]
+        for rel in info.get("masked", []):
+            args += ["-v", f"/dev/null:/workspace/ro/{name}/{rel}:ro"]
+    return args
+
+
 def ensure_container(tid: str) -> str:
-    """Create/start the chat's container on demand; keep at most MAX_RUNNING running."""
+    """Create/start the chat's container on demand; keep at most MAX_RUNNING running.
+    The mounts follow the chat's attached box checkouts; a changed set recreates the container
+    (/workspace persists on the host, so only running processes are lost)."""
     name = cname(tid)
     with _LOCK:
+        mounts = _mount_args(tid)
+        sig = hashlib.sha1(json.dumps([LAYOUT, mounts]).encode()).hexdigest()[:12]
         st = _state(name)
-        if st != "running":
-            _make_room(tid)
-        if st is not None and _label(name, "pda.v") != LAYOUT:  # older layout (no read-only mount): recreate
+        if st is not None and _label(name, "pda.sig") != sig:
             _run(["docker", "rm", "-f", name], timeout=60)
             st = None
+        if st != "running":
+            _make_room(tid)
         if st is None:
             work = ws_dir(tid) / "work"
-            ro = ws_dir(tid) / "ro"
             (work / ".home").mkdir(parents=True, exist_ok=True)
-            ro.mkdir(parents=True, exist_ok=True)
-            r = _run(["docker", "run", "-d", "--name", name, "--label", "pda=1", "--label", f"pda.v={LAYOUT}",
+            (ws_dir(tid) / "ro").mkdir(parents=True, exist_ok=True)
+            r = _run(["docker", "run", "-d", "--name", name, "--label", "pda=1", "--label", f"pda.sig={sig}",
                       "--user", "1000:1000",
                       "--memory", "2g", "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "512",
-                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                      "-v", f"{work}:/workspace", "-v", f"{ro}:/workspace/ro:ro", IMAGE], timeout=60)
+                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *mounts, IMAGE], timeout=60)
             if r.returncode:
                 raise RuntimeError(f"sandbox start failed: {r.stderr.decode()[:300]}")
         elif st != "running":
@@ -196,6 +257,9 @@ def clone_into_sandbox(tid: str, repo: str, base_branch: str | None, identity: t
     pristine = ws_dir(tid) / "pristine" / name
     pristine.parent.mkdir(parents=True, exist_ok=True)
     args = [*SAFE_GIT, "clone", "--single-branch", "--no-tags"]
+    box = local_checkouts().get(repo.lower())
+    if box:  # borrow the box checkout's objects (git alternates): only missing objects come from GitHub
+        args += ["--reference-if-able", box]
     if base_branch:
         args += ["--branch", base_branch]
     r = _run([*args, f"git@github.com:{repo}.git", str(pristine)], timeout=600)
@@ -217,7 +281,7 @@ def clone_into_sandbox(tid: str, repo: str, base_branch: str | None, identity: t
     if r.returncode:
         raise RuntimeError(f"sandbox clone failed: {(r.stdout + r.stderr).decode()[-300:]}")
     info = {"repo": repo, "dir": f"/workspace/{name}", "mode": "write", "base_branch": base, "base_sha": sha,
-            "branch": branch}
+            "branch": branch, "source": "box+github" if box else "github"}
     m["repos"][name] = info
     _save_meta(tid, m)
     return info
@@ -227,14 +291,26 @@ def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
     """Shallow host-side clone into <ws>/ro/<name>, which the container sees READ-ONLY at /workspace/ro/<name>.
     The container cannot write there, so the host may safely run git in it (clone/refresh)."""
     name = repo.split("/")[1]
-    m = _meta(tid) if ws_dir(tid).exists() else {"repos": {}}
+    ws_dir(tid).mkdir(parents=True, exist_ok=True)
+    m = _meta(tid)
     ro = m.setdefault("readonly", {})
     dest = ws_dir(tid) / "ro" / name
     if name in m.get("repos", {}):
         return {**m["repos"][name], "note": "already attached writable at /workspace/" + name}
+    if name in ro and ro[name].get("source") == "box":
+        return {**{k: v for k, v in ro[name].items() if k != "box_path"}, "note": "live box checkout"}
     if name in ro:  # refresh to the latest state of the branch
         r = _run([*SAFE_GIT, "-C", str(dest), "pull", "-q", "--ff-only", "--depth", "1"], timeout=600)
         return {**ro[name], "refreshed": r.returncode == 0}
+    box = local_checkouts().get(repo.lower())
+    if box and not ref:  # no second clone: mount the box's own checkout read-only (live state)
+        branch = _run(["git", "-C", box, "rev-parse", "--abbrev-ref", "HEAD"], timeout=10).stdout.decode().strip()
+        info = {"repo": repo, "dir": f"/workspace/ro/{name}", "mode": "read", "branch": branch,
+                "source": "box", "box_path": box, "masked": _secret_files(box)}
+        ro[name] = info
+        _save_meta(tid, m)
+        ensure_container(tid)  # remount
+        return {k: v for k, v in info.items() if k != "box_path"}
     dest.parent.mkdir(parents=True, exist_ok=True)
     args = [*SAFE_GIT, "clone", "-q", "--depth", "1", "--single-branch", "--no-tags"]
     if ref:
@@ -244,7 +320,7 @@ def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
         shutil.rmtree(dest, ignore_errors=True)
         raise RuntimeError(f"clone failed: {r.stderr.decode()[-300:]}")
     branch = _run([*SAFE_GIT, "-C", str(dest), "rev-parse", "--abbrev-ref", "HEAD"]).stdout.decode().strip()
-    info = {"repo": repo, "dir": f"/workspace/ro/{name}", "mode": "read", "branch": branch}
+    info = {"repo": repo, "dir": f"/workspace/ro/{name}", "mode": "read", "branch": branch, "source": "github"}
     ro[name] = info
     _save_meta(tid, m)
     return info
@@ -253,7 +329,26 @@ def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
 def workspace(tid: str) -> list[dict]:
     m = _meta(tid) if ws_dir(tid).exists() else {}
     out = [{**v, "mode": "write"} for v in m.get("repos", {}).values()]
-    return out + list(m.get("readonly", {}).values())
+    return out + [{k: v for k, v in r.items() if k not in ("box_path", "masked")}
+                  for r in m.get("readonly", {}).values()]
+
+
+def detach(tid: str, name: str) -> None:
+    """Remove a repo from the chat's workspace (writable copies: unpushed sandbox work is lost)."""
+    m = _meta(tid)
+    if name in m.get("readonly", {}):
+        info = m["readonly"].pop(name)
+        _save_meta(tid, m)
+        if info.get("source") != "box":
+            shutil.rmtree(ws_dir(tid) / "ro" / name, ignore_errors=True)  # host-only dir, not writable in the box
+        ensure_container(tid)
+    elif name in m.get("repos", {}):
+        m["repos"].pop(name)
+        _save_meta(tid, m)
+        dexec(tid, ["rm", "-rf", "--", f"/workspace/{name}"], timeout=120)
+        shutil.rmtree(ws_dir(tid) / "pristine" / name, ignore_errors=True)
+    else:
+        raise RuntimeError(f"{name} is not attached")
 
 
 def export_commits(tid: str, name: str) -> dict:

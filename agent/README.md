@@ -4,22 +4,31 @@ A LangChain [DeepAgent](https://github.com/langchain-ai/deepagents) chat service
 
 - `agentd.py`: FastAPI on `127.0.0.1:8800`, published tailnet-only as `https://paper1.tailbf37ab.ts.net:8448`
   (mapping + keepalive in `~/.claude/loops/review_server_start.sh`). Same bearer token as the PaperDesk server.
-- `config.toml`: model endpoint (OpenAI-compatible). Testing runs on ScaDS.AI (`SCADS_API_KEY`), whose daily
-  request cap is shared with the paper studies, so keep chats moderate.
+- `config.toml`: model endpoint (OpenAI-compatible). **EU-hosted LLMs only** (Joern 2026-11-09): `agentd.py`
+  refuses to start unless the endpoint host is on its in-code `EU_ENDPOINTS` allowlist and `region = "EU"`.
+  Allowed: ScaDS.AI (`llm.scads.ai`, TU Dresden/Leipzig, `SCADS_API_KEY`; daily cap shared with the paper studies)
+  and OpenRouter's EU in-region routing (`eu.openrouter.ai` only, needs a Business plan; plain `openrouter.ai` is
+  refused because the request passes a US company). No repo is deny-listed (EBL is fine on EU models).
 - Conversations: LangGraph SQLite checkpointer in `~/.local/state/paperdesk/agent.sqlite`.
 - Tools: DeepAgent built-ins (todos, files, `execute` shell, sub-agents) inside a **per-chat Docker sandbox**
   (`sandbox.py`, image `pda-sandbox:1` from `sandbox/Dockerfile`: uid 1000, caps dropped, 2 GB / 2 CPU / 512 PIDs,
   no secrets; `/workspace` = `/vol/scratch/agent-ws/<chat>/work`; idle containers stop after 30 min, at most 3
   run; deleting a chat removes its sandbox). GitHub read tools on the box's `gh` login (`ghtools.py`).
-- **Repos per chat, read vs write** (0.3): any number of repos. READ-ONLY ones are shallow host clones in
-  `<ws>/ro/<name>`, mounted `:ro` at `/workspace/ro/<name>` (the agent cannot change them; no PR possible). The agent
+- **Repos per chat, read vs write** (0.3): any number of repos. READ-ONLY ones are mounted `:ro` at
+  `/workspace/ro/<name>` (the agent cannot change them; no PR possible). **No double clones** (0.4): a repo with a
+  checkout on the box (`~/*`, `/vol/home/*` with a GitHub origin) is bind-mounted read-only from there (live
+  state incl. uncommitted work; secret-looking files such as `.env`, `*.pem`, `local.properties` are covered with
+  `/dev/null`); others are shallow host clones in `<ws>/ro/<name>`. Writable copies of box repos borrow its git
+  objects (`--reference`), so only missing objects come from GitHub. Live checkouts are never written. The agent
   may attach reference repos itself (`clone_repo_readonly`). WRITABLE ones (`/workspace/<name>`, work branch) only
   when Joern picks them at chat setup / via the attach endpoint, or approves the agent's `clone_repo_writable`.
 - Code + PR: a writable attach makes a host-side pristine clone and hands it to the sandbox as a git bundle; the agent
   edits, tests in a venv and commits there; `review_changes`/`open_pull_request` bundle the commits back into the
   pristine clone, refuse `.github/` changes, push branch `agent/<chat>-<repo>` over SSH and open a **draft** PR.
   The host never runs git inside the sandbox's workspace (planted hooks/config cannot reach it).
-- **Approval-gated**: `open_pull_request`, `clone_repo_writable`, `github_comment`, `github_create_issue`. Writes only to `write_owners`
+- **Writes**: `open_pull_request` (draft), `clone_repo_writable`, `github_comment`, `github_create_issue`.
+  Approvals default to **auto** (`[approvals] default`, Joern 2026-11-09): they run directly and their
+  `tool_call` carries `auto_approved: true`. A chat set to `ask` gates them behind approve/reject. Writes only to `write_owners`
   repos; `deny` repos (EBL) are off-limits (`config.toml [github]`).
 - Model choice (ScaDS, 2026-11-09): DeepSeek-V4.1-Flash is the default because it completed clone -> venv ->
   479 tests -> edit -> commit -> PR on its own (~5 min); gpt-oss-120b (fast for chat) and GLM-5.3-Flash stalled.
@@ -31,9 +40,12 @@ A LangChain [DeepAgent](https://github.com/langchain-ai/deepagents) chat service
 - `GET  /api/agent/threads` → `{threads: [{id, title, created, updated, model}]}`
 - `POST /api/agent/threads` body `{title?, model?, repos?: [{repo, mode: "read"|"write"}]}` → thread (repos are
   cloned when the first message runs and show up as `attach_repo` boxes)
-- `GET  /api/agent/repos` → `{repos: [{repo, description, private, pushed, writable}]}` for the repo picker
+- `GET  /api/agent/repos` → `{repos: [{repo, description, on_box, private, pushed, writable}]}` for the picker
   (deny-listed repos left out; `writable` = owner allowed for write mode)
 - `POST /api/agent/threads/<id>/repos` body `{repo, mode}` → `{attached, workspace}`: attach now (400 on refusal)
+- `DELETE /api/agent/threads/<id>/repos/<name>` → `{workspace}`: detach (a writable copy's unpushed work is lost)
+- `PATCH /api/agent/threads/<id>` body `{title?, approvals?: "auto"|"ask"}`; threads carry `approvals`
+- workspace entries: `{repo, dir, mode, branch, source: box|github|box+github, masked?}`
 - `GET  /api/agent/threads/<id>` → thread + `messages: [{role: user|assistant|tool_call|tool_result, text, name?}]`
 - `DELETE /api/agent/threads/<id>`
 - `GET  /api/agent/threads/<id>` → thread + `messages` (flat) + `turns: [{user, steps: [rows], answer}]` (steps =

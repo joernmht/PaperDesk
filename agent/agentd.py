@@ -39,10 +39,33 @@ DIR = Path(__file__).resolve().parent
 STATE = HOME / ".local/state/paperdesk"
 DB_PATH = STATE / "agent.sqlite"
 TOKEN_FILE = HOME / ".config/paperdesk/token"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 CONFIG = tomllib.loads((DIR / "config.toml").read_text())
 POLICY = ghtools.Policy(CONFIG.get("github", {}))
+APPROVALS_DEFAULT = CONFIG.get("approvals", {}).get("default", "auto")
+
+# EU-ONLY model hosting (Joern 2026-11-09). Chat content (incl. private repos, EBL) may only reach LLM
+# endpoints hosted in Europe. Hosts are allow-listed here in code ON PURPOSE, so a config edit alone cannot
+# add a non-EU endpoint. Not allowed: OpenRouter (US company in the request path), US/CN model APIs.
+EU_ENDPOINTS = {
+    "llm.scads.ai": "ScaDS.AI, TU Dresden / Leipzig University (Germany)",
+    # OpenRouter's EU in-region routing ONLY (never openrouter.ai): payloads are decrypted in Europe and go
+    # only to EU/EEA/UK/CH provider endpoints, failing rather than leaving the region. Needs a Business plan
+    # (2026-11-09: Joern's key gets 403). Billing/account data may still be processed in the US.
+    "eu.openrouter.ai": "OpenRouter EU in-region routing (European providers only)",
+}
+
+
+def _check_eu(m: dict) -> str:
+    from urllib.parse import urlparse
+    host = (urlparse(m["base_url"]).hostname or "").lower()
+    if m.get("region") != "EU" or host not in EU_ENDPOINTS:
+        raise SystemExit(f"refusing to start: model endpoint {host!r} is not on the EU-hosted allowlist")
+    return EU_ENDPOINTS[host]
+
+
+HOSTING = _check_eu(CONFIG["model"])
 
 SYSTEM_PROMPT = """You are Joern's research and coding assistant inside his PaperDesk phone app.
 Joern is a PhD researcher at TU Dresden (Chair of Railway Operations) working on LLMs and
@@ -58,7 +81,8 @@ For multi-step work, plan with write_todos and keep it updated.
 GitHub: use the github_* tools to read repos, issues, PRs, files and CI runs.
 
 Repos in this chat: WRITABLE ones live at /workspace/<name> on a work branch (only these can become a PR);
-READ-ONLY ones at /workspace/ro/<name> (reference material; you cannot change them). Attach more
+READ-ONLY ones at /workspace/ro/<name> (reference material; you cannot change them; repos that have a checkout
+on Joern's box show its live state, incl. uncommitted work, with secret files blanked). Attach more
 reference repos yourself with clone_repo_readonly. Need to change a repo that is not writable yet?
 Call clone_repo_writable (Joern approves). list_workspace shows what is attached.
 
@@ -90,6 +114,8 @@ def _conn() -> sqlite3.Connection:
         id TEXT PRIMARY KEY, title TEXT, created TEXT, updated TEXT, model TEXT)""")
     if "repos" not in [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]:
         c.execute("ALTER TABLE pd_threads ADD COLUMN repos TEXT DEFAULT '[]'")  # chat setup: [{repo, mode}]
+    if "approvals" not in [r[1] for r in c.execute("PRAGMA table_info(pd_threads)")]:
+        c.execute("ALTER TABLE pd_threads ADD COLUMN approvals TEXT")  # auto | ask | NULL = config default
     c.commit()
     return c
 
@@ -101,12 +127,13 @@ CHECKPOINTER = None
 AGENTS: "OrderedDict[tuple[str, str], object]" = OrderedDict()
 
 
-def build_agent(tid: str, model_name: str):
+def build_agent(tid: str, model_name: str, approvals: str):
     from deepagents import create_deep_agent
     from deepagents.backends import CompositeBackend, StateBackend
     from langchain_openai import ChatOpenAI
 
     m = CONFIG["model"]
+    _check_eu(m)  # every agent build re-checks the endpoint
     llm = ChatOpenAI(model=model_name, base_url=m["base_url"], api_key=os.environ[m["api_key_env"]],
                      temperature=m.get("temperature", 0.3), timeout=m.get("timeout", 120), max_retries=2)
     tools, interrupt_on = ghtools.make_tools(tid, POLICY)
@@ -117,8 +144,12 @@ def build_agent(tid: str, model_name: str):
     prompt = SYSTEM_PROMPT + "\n\nAttached now:\n" + ("\n".join(
         f"- {r['repo']} at {r['dir']} ({'WRITABLE, branch ' + r['branch'] if r['mode'] == 'write' else 'read-only'})"
         for r in ws) or "- nothing yet")
+    prompt += ("\n\nApprovals: OFF. Writes (writable clone, PR, comment, issue) run directly, so be sure before you call them."
+               if approvals == "auto" else
+               "\n\nApprovals: ON. Writes (writable clone, PR, comment, issue) wait for Joern's approve/reject.")
     return create_deep_agent(model=llm, tools=tools, system_prompt=prompt, backend=backend,
-                             interrupt_on=interrupt_on, checkpointer=CHECKPOINTER)
+                             interrupt_on=interrupt_on if approvals == "ask" else None,
+                             checkpointer=CHECKPOINTER)
 
 
 def forget_agent(tid: str) -> None:
@@ -128,15 +159,18 @@ def forget_agent(tid: str) -> None:
             AGENTS.pop(key)
 
 
-def agent_for(tid: str, model_name: str):
+def agent_for(tid: str, model_name: str, approvals: str | None = None):
     global CHECKPOINTER
+    if approvals is None:
+        row = thread_row(tid)
+        approvals = (row or {}).get("approvals") or APPROVALS_DEFAULT
     with DB_LOCK:
         if CHECKPOINTER is None:
             from langgraph.checkpoint.sqlite import SqliteSaver
             CHECKPOINTER = SqliteSaver(DB)
-        key = (tid, model_name)
+        key = (tid, model_name, approvals)
         if key not in AGENTS:
-            AGENTS[key] = build_agent(tid, model_name)
+            AGENTS[key] = build_agent(tid, model_name, approvals)
             while len(AGENTS) > 16:
                 AGENTS.popitem(last=False)
         AGENTS.move_to_end(key)
@@ -275,12 +309,13 @@ def history(tid: str, model_name: str) -> list[dict]:
     return out
 
 
-COLS = ("id", "title", "created", "updated", "model", "repos")
+COLS = ("id", "title", "created", "updated", "model", "repos", "approvals")
 
 
 def _row(r) -> dict:
     d = dict(zip(COLS, r))
     d["repos"] = json.loads(d.get("repos") or "[]")
+    d["approvals"] = d.get("approvals") or APPROVALS_DEFAULT
     return d
 
 
@@ -371,7 +406,10 @@ def _stream(tid: str, row: dict, inp, lock: threading.Lock):
                                 if mid == seg:
                                     final = []
                             for tc in getattr(msg, "tool_calls", None) or []:
-                                yield json.dumps(call_event(tc)) + "\n"
+                                ev = call_event(tc)
+                                if tc["name"] in ghtools.GATED and row.get("approvals") == "auto":
+                                    ev["auto_approved"] = True
+                                yield json.dumps(ev) + "\n"
                                 if tc["name"] == "write_todos":
                                     yield json.dumps(todos_event(tc.get("args"))) + "\n"
                         elif getattr(msg, "type", "") == "tool":
@@ -435,6 +473,12 @@ class NewThread(BaseModel):
     title: str | None = None
     model: str | None = None
     repos: list[RepoSpec] = []
+    approvals: str | None = None  # auto | ask (default from config)
+
+
+class ThreadPatch(BaseModel):
+    title: str | None = None
+    approvals: str | None = None
 
 
 class ChatIn(BaseModel):
@@ -452,14 +496,15 @@ def index():
     return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>PaperDesk agent</title><body style="font-family:sans-serif;padding:16px">
 <h2>PaperDesk agent is running</h2><p>Version {VERSION} &middot; model <code>{m['name']}</code>
-via {m['base_url']}</p><p>Chat from the PaperDesk app. API: <code>/api/agent/health</code>.</p>"""
+on {HOSTING} (EU-hosted only)</p><p>Chat from the PaperDesk app. API: <code>/api/agent/health</code>.</p>"""
 
 
 @app.get("/api/agent/health")
 def health():
     return {"ok": True, "version": VERSION, "model": CONFIG["model"]["name"],
             "models": CONFIG["model"].get("choices", [CONFIG["model"]["name"]]),
-            "features": ["github_read", "sandbox", "pull_requests", "approvals"]}
+            "hosting": HOSTING, "region": "EU", "approvals_default": APPROVALS_DEFAULT,
+            "features": ["github_read", "sandbox", "pull_requests", "approvals", "repos"]}
 
 
 @app.get("/api/agent/threads", dependencies=[Depends(authed)])
@@ -479,11 +524,32 @@ def repo_choices():
                                      "nameWithOwner,description,visibility,pushedAt,isArchived"))
         _REPO_CACHE.update(t=time.time(), repos=sorted(
             ({"repo": r["nameWithOwner"], "description": r.get("description") or "",
+              "on_box": r["nameWithOwner"].lower() in sandbox.local_checkouts(),
               "private": r["visibility"] != "PUBLIC", "pushed": r["pushedAt"],
               "writable": r["nameWithOwner"].split("/")[0].lower() in POLICY.write_owners}
              for r in raw if r["nameWithOwner"].lower() not in POLICY.deny and not r.get("isArchived")),
             key=lambda r: r["pushed"], reverse=True))
     return {"repos": _REPO_CACHE["repos"]}
+
+
+@app.delete("/api/agent/threads/{tid}/repos/{name}", dependencies=[Depends(authed)])
+def remove_repo(tid: str, name: str):
+    """Detach a repo from a chat (a writable copy's unpushed sandbox work is dropped)."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise HTTPException(400, "bad repo name")
+    row, lock = _begin(tid)
+    try:
+        sandbox.detach(tid, name)
+        with DB_LOCK:
+            specs = [r for r in row["repos"] if r["repo"].split("/")[1] != name]
+            DB.execute("UPDATE pd_threads SET repos=? WHERE id=?", (json.dumps(specs), tid))
+            DB.commit()
+        forget_agent(tid)
+        return {"workspace": sandbox.workspace(tid)}
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        lock.release()
 
 
 @app.post("/api/agent/threads/{tid}/repos", dependencies=[Depends(authed)])
@@ -518,12 +584,31 @@ def new_thread(body: NewThread):
             specs.append({"repo": POLICY.check(r.repo, write=r.mode == "write"), "mode": r.mode})
         except (ValueError, PermissionError) as e:
             raise HTTPException(400, str(e))
+    if body.approvals not in (None, "auto", "ask"):
+        raise HTTPException(400, "approvals must be auto or ask")
     tid = uuid.uuid4().hex[:12]
     with DB_LOCK:
-        DB.execute(f"INSERT INTO pd_threads({','.join(COLS)}) VALUES(?,?,?,?,?,?)",
-                   (tid, body.title or "New chat", now(), now(), model, json.dumps(specs)))
+        DB.execute(f"INSERT INTO pd_threads({','.join(COLS)}) VALUES(?,?,?,?,?,?,?)",
+                   (tid, body.title or "New chat", now(), now(), model, json.dumps(specs),
+                    body.approvals or APPROVALS_DEFAULT))
         DB.commit()
     return thread_row(tid)  # repos are cloned when the first message runs (shown as attach_repo boxes)
+
+
+@app.patch("/api/agent/threads/{tid}", dependencies=[Depends(authed)])
+def patch_thread(tid: str, body: ThreadPatch):
+    if not thread_row(tid):
+        raise HTTPException(404, "no such thread")
+    if body.approvals not in (None, "auto", "ask"):
+        raise HTTPException(400, "approvals must be auto or ask")
+    with DB_LOCK:
+        if body.title:
+            DB.execute("UPDATE pd_threads SET title=? WHERE id=?", (body.title[:80], tid))
+        if body.approvals:
+            DB.execute("UPDATE pd_threads SET approvals=? WHERE id=?", (body.approvals, tid))
+        DB.commit()
+    forget_agent(tid)
+    return thread_row(tid)
 
 
 @app.delete("/api/agent/threads/{tid}", dependencies=[Depends(authed)])
@@ -595,13 +680,14 @@ def main():
     c.add_argument("--thread", default=None)
     c.add_argument("--model", default=None)
     c.add_argument("--repo", action="append", default=[], help="owner/name[:write] (repeatable)")
+    c.add_argument("--ask", action="store_true", help="this chat asks before writes")
     a = ap.parse_args()
     if a.cmd == "serve":
         import uvicorn
         uvicorn.run(app, host="127.0.0.1", port=a.port, log_level="info")
         return
     specs = [RepoSpec(repo=r.split(":")[0], mode="write" if r.endswith(":write") else "read") for r in a.repo]
-    tid = a.thread or new_thread(NewThread(model=a.model, repos=specs))["id"]
+    tid = a.thread or new_thread(NewThread(model=a.model, repos=specs, approvals="ask" if a.ask else None))["id"]
     row, lock = _begin(tid)
     t0 = time.time()
     for line in _stream(tid, row, a.text, lock):
