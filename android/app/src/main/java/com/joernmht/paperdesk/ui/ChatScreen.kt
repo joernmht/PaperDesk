@@ -109,11 +109,27 @@ import com.mikepenz.markdown.m3.Markdown
 import org.json.JSONObject
 import com.joernmht.paperdesk.ChatThread
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.CancellationException
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Autorenew
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.joernmht.paperdesk.ApiException
+import com.joernmht.paperdesk.BusyException
+import com.joernmht.paperdesk.ChatNav
+import com.joernmht.paperdesk.ChatWatchWorker
 
 /** Chat with the box's DeepAgent service (~/PaperDesk/agent, owned by the admin session). */
 @Composable
 fun ChatScreen(app: AppCtx, reloadKey: Int) {
     var open by rememberSaveable { mutableStateOf<String?>(null) }
+    val nav by ChatNav.open
+    LaunchedEffect(nav) { nav?.let { open = it; ChatNav.open.value = null } }
     val o = open
     if (o == null) ThreadList(app, reloadKey) { open = it }
     else {
@@ -164,8 +180,14 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
                 if (error == null && threads.isEmpty() && !loading) item { Text("No chats yet. Start one below.", Modifier.padding(16.dp)) }
                 items(threads, key = { it.id }) { t ->
                     ListItem(
-                        headlineContent = { Text(t.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-                        supportingContent = { Text("${t.model.substringAfter('/')} · ${t.updated.replace('T', ' ').take(16)}") },
+                        headlineContent = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (t.origin?.startsWith("loop") == true) Tag("loop")
+                                Text(t.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                        },
+                        supportingContent = { Text(listOfNotNull(t.model.substringAfter('/'), t.updated.replace('T', ' ').take(16),
+                            "answering…".takeIf { t.running }).joinToString(" · ")) },
                         trailingContent = { IconButton(onClick = { delete = t }) { Icon(Icons.Filled.Delete, "Delete") } },
                         modifier = Modifier.clickable { onOpen(t.id) },
                     )
@@ -177,9 +199,9 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp))
     }
 
-    if (setup) NewChatDialog(app, models, defaultModel, onDismiss = { setup = false }) { model, repos, approvals ->
+    if (setup) NewChatDialog(app, models, defaultModel, onDismiss = { setup = false }) { model, repos, approvals, subagents ->
         setup = false
-        app.run(null, { app.agent.newThread(model, repos, approvals) }) { onOpen(it.id) }
+        app.run(null, { app.agent.newThread(model, repos, approvals, subagents) }) { onOpen(it.id) }
     }
 
     delete?.let { t ->
@@ -245,9 +267,10 @@ private fun RepoPicker(app: AppCtx, chosen: MutableMap<String, String>, exclude:
 
 @Composable
 private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: String, onDismiss: () -> Unit,
-                          onStart: (String?, List<Pair<String, String>>, String) -> Unit) {
+                          onStart: (String?, List<Pair<String, String>>, String, Boolean) -> Unit) {
     var model by remember { mutableStateOf(defaultModel) }
     var ask by remember { mutableStateOf(false) }
+    var subagents by remember { mutableStateOf(true) }
     var modelMenu by remember { mutableStateOf(false) }
     val chosen = remember { mutableStateMapOf<String, String>() }
     AlertDialog(
@@ -266,12 +289,17 @@ private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: Strin
                     Spacer(Modifier.width(8.dp))
                     Text(if (ask) "Ask me before writes (PRs, comments)" else "Writes run automatically", style = MaterialTheme.typography.labelMedium)
                 }
+                Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Switch(subagents, onCheckedChange = { subagents = it })
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (subagents) "Sub-agents allowed (own fresh context per sub-task)" else "No sub-agents", style = MaterialTheme.typography.labelMedium)
+                }
                 Text("Repos (optional; read-only unless you switch on write)", style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
                 RepoPicker(app, chosen)
             }
         },
-        confirmButton = { TextButton(onClick = { onStart(model.ifBlank { null }, chosen.map { it.key to it.value }, if (ask) "ask" else "auto") }) { Text("Start") } },
+        confirmButton = { TextButton(onClick = { onStart(model.ifBlank { null }, chosen.map { it.key to it.value }, if (ask) "ask" else "auto", subagents) }) { Text("Start") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -285,6 +313,7 @@ data class Turn(
     val live: Map<Int, String> = emptyMap(),           // streaming text per seg, not yet known to be narration
     val segAt: Map<Int, Int> = emptyMap(),             // seg -> steps index when it began (narration goes there)
     val done: Boolean = true,
+    val stopped: Boolean = false,
 )
 
 private fun Turn.addStepEvent(o: JSONObject, kind: String): Turn = when (kind) {
@@ -329,24 +358,68 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var repoMenu by remember { mutableStateOf(false) }
     var approvals by remember { mutableStateOf("auto") }
+    var subagents by remember { mutableStateOf(true) }
+    var limits by remember { mutableStateOf("") }
+    var activity by remember { mutableStateOf<String?>(null) }
+    var lastSeq by remember { mutableStateOf(0) }
     val list = rememberLazyListState()
+    val viewScope = rememberCoroutineScope()
 
-    suspend fun reload() {
-        val r = app.agent.thread(id)
-        val t = ChatThread.from(r); title = t.title; model = t.model; approvals = t.approvals
-        turns.clear(); turns.addAll(turnsFromHistory(r) { l -> todos = l })
-        workspace.clear(); workspace.addAll(parseWorkspace(r))
+    // "this chat is on screen" (no "Chat answered" notification for it)
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(id, owner) {
+        if (owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) ChatNav.visible = id
+        val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_START) ChatNav.visible = id
+            if (e == Lifecycle.Event.ON_STOP) ChatNav.visible = null
+        }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs); if (ChatNav.visible == id) ChatNav.visible = null }
     }
-    LaunchedEffect(id) { try { reload() } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName } }
-    LaunchedEffect(turns.size, turns.lastOrNull()?.let { it.answer.length + it.live.values.sumOf { s -> s.length } + it.steps.size }) {
-        if (turns.isNotEmpty()) list.scrollToItem(turns.size - 1, Int.MAX_VALUE / 2)
+
+    /** Apply a GET /threads/{id}; returns true when a run is still going (its turn is then rebuilt by replay). */
+    fun apply(r: JSONObject): Boolean {
+        val t = ChatThread.from(r); title = t.title; model = t.model; approvals = t.approvals; subagents = t.subagents
+        val hist = turnsFromHistory(r) { l -> todos = l }
+        val run = r.optJSONObject("run")
+        turns.clear()
+        workspace.clear(); workspace.addAll(parseWorkspace(r))
+        return if (t.running && run != null) {
+            turns.addAll(hist.dropLast(1))              // the running turn comes back via /events replay
+            lastSeq = run.optInt("first_seq", 1) - 1
+            true
+        } else {
+            turns.addAll(hist); lastSeq = t.lastSeq
+            false
+        }
     }
 
     fun onEvent(ev: JSONObject) {
+        val seq = ev.optInt("seq", -1)
+        if (seq >= 0) { if (seq <= lastSeq) return; lastSeq = seq }
+        val type = ev.optString("type")
+        if (type == "ping") {
+            val el = ev.optInt("elapsed", 0)
+            activity = ev.optString("activity").ifBlank { "working" } + (if (el > 0) " · ${el / 60}:${"%02d".format(el % 60)}" else "")
+            return
+        }
+        activity = null
+        if (type == "start") {
+            if (turns.isEmpty() || turns.last().done) {
+                val txt = ev.optString("text")
+                val label = when {
+                    ev.optString("kind") != "resume" -> txt
+                    txt == "approve" -> "✓ Approved"
+                    else -> "✗ Rejected" + txt.removePrefix("reject").removePrefix(":").trim().takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
+                }
+                turns.add(Turn(user = label, done = false))
+            }
+            return
+        }
         if (turns.isEmpty()) return
         val i = turns.size - 1
         val t = turns[i]
-        turns[i] = when (val type = ev.optString("type")) {
+        turns[i] = when (type) {
             "token" -> {
                 val seg = ev.optInt("seg", 0)
                 t.copy(live = t.live + (seg to (t.live[seg].orEmpty() + ev.optString("text"))),
@@ -362,22 +435,73 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
             "tool_call", "tool_result" -> t.addStepEvent(ev, type)
             "todos" -> { todos = parseTodos(ev); t }
             "approval" -> { val ap = approvalFrom(ev); if (t.approvals.any { it.id == ap.id }) t else t.copy(approvals = t.approvals + ap) }
-            "done" -> t.copy(answer = ev.optString("text").ifBlank { t.live.toSortedMap().values.lastOrNull().orEmpty() }, live = emptyMap(), done = true)
-            "error" -> { error = ev.optString("text"); t }
+            "done" -> if (ev.optBoolean("cancelled")) t.copy(answer = "", live = emptyMap(), done = true, stopped = true)
+                      else t.copy(answer = ev.optString("text").ifBlank { t.live.toSortedMap().values.lastOrNull().orEmpty() }, live = emptyMap(), done = true)
+            "error" -> { error = ev.optString("text"); t.copy(done = true, answer = t.answer.ifBlank { t.live.toSortedMap().values.lastOrNull().orEmpty() }, live = emptyMap()) }
             else -> t
         }
     }
 
-    fun run(block: suspend ((JSONObject) -> Unit) -> Unit) {
+    /**
+     * Run [first] (a /chat or /resume POST, or null = just follow a running turn) and stay attached until the run
+     * ends. The run lives on the box: when the phone drops the connection ("Software caused connection abort"),
+     * re-attach with /events?since=<last seq> instead of failing. Leaving the chat stops following; the
+     * ChatWatchWorker then notifies when the answer is there.
+     */
+    fun follow(first: (suspend ((JSONObject) -> Unit) -> Unit)?) {
         busy = true; error = null
-        app.scope.launch {
-            try { block { onEvent(it) } } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
+        ChatWatchWorker.watch(app.ctx, id)
+        viewScope.launch {
+            var ended = false
+            val handler: (JSONObject) -> Unit = { ev ->
+                onEvent(ev)
+                val ty = ev.optString("type"); if (ty == "done" || ty == "error") ended = true
+            }
+            var pending = first
+            var attempt = 0
+            while (!ended && isActive) {
+                try {
+                    val p = pending; pending = null
+                    if (p != null) p(handler) else app.agent.events(id, lastSeq, handler)
+                    attempt = 0
+                    if (!ended && !app.agent.thread(id).optBoolean("running")) {   // stream ended without done
+                        apply(app.agent.thread(id)); ended = true
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: BusyException) {
+                    error = e.message; turns.removeAt(turns.size - 1); break
+                } catch (e: ApiException) {
+                    error = e.message; break
+                } catch (e: Exception) {   // connection dropped: the run keeps going on the box
+                    activity = "Reconnecting…"
+                    delay(minOf(2_000L shl attempt.coerceAtMost(3), 10_000L)); attempt++
+                    try {
+                        val r = app.agent.thread(id)
+                        if (!r.optBoolean("running")) { apply(r); ended = true }
+                    } catch (_: Exception) {}
+                }
+            }
             if (turns.isNotEmpty()) turns[turns.size - 1] = turns.last().let { t ->
                 if (t.done) t else t.copy(done = true, answer = t.answer.ifBlank { t.live.toSortedMap().values.lastOrNull().orEmpty() }, live = emptyMap())
             }
-            busy = false
+            busy = false; activity = null
             try { workspace.clear(); workspace.addAll(parseWorkspace(app.agent.thread(id))) } catch (_: Exception) {}
         }
+    }
+
+    LaunchedEffect(id) {
+        try {
+            if (apply(app.agent.thread(id))) follow(null)
+        } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
+        try {
+            val h = app.agent.healthRaw().optJSONObject("limits")?.optJSONObject(model)
+            if (h != null) limits = "context ${tok(h.optInt("effective_input_tokens"))} of ${tok(h.optInt("max_input_tokens"))}" +
+                " · summarises at ${tok(h.optInt("summarize_at"))}"
+        } catch (_: Exception) {}
+    }
+    LaunchedEffect(turns.size, turns.lastOrNull()?.let { it.answer.length + it.live.values.sumOf { s -> s.length } + it.steps.size }) {
+        if (turns.isNotEmpty()) list.scrollToItem(turns.size - 1, Int.MAX_VALUE / 2)
     }
 
     fun markApprovals(state: String) {
@@ -391,14 +515,14 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
         markApprovals("answered in chat")
         turns.add(Turn(user = text, done = false))
         if (title == "New chat") title = text.take(60)
-        run { onEv -> app.agent.chat(id, text, onEv) }
+        follow { onEv -> app.agent.chat(id, text, onEv) }
     }
 
     fun decide(approve: Boolean, reason: String?) {
         if (busy) return
         markApprovals(if (approve) "approved" else "rejected")
         turns.add(Turn(user = if (approve) "✓ Approved" else "✗ Rejected" + (reason?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""), done = false))
-        run { onEv -> app.agent.resume(id, approve, reason, onEv) }
+        follow { onEv -> app.agent.resume(id, approve, reason, onEv) }
     }
 
     Column(Modifier.fillMaxSize().imePadding()) {
@@ -406,7 +530,8 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
             Column(Modifier.weight(1f)) {
                 Text(title.ifBlank { "Chat" }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (model.isNotBlank()) Text(model.substringAfter('/'), style = MaterialTheme.typography.labelSmall,
+                if (model.isNotBlank()) Text(listOf(model.substringAfter('/'), limits).filter { it.isNotBlank() }.joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             TextButton(onClick = {
@@ -417,6 +542,14 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
                 Icon(if (approvals == "ask") Icons.Filled.FrontHand else Icons.Filled.Bolt, null, Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
                 Text(if (approvals == "ask") "Ask" else "Auto", style = MaterialTheme.typography.labelMedium)
+            }
+            IconButton(onClick = {
+                val next = !subagents
+                app.run(if (next) "Sub-agents allowed (from the next message)" else "No sub-agents (from the next message)",
+                    { app.agent.setSubagents(id, next) }) { subagents = it.subagents }
+            }) {
+                Icon(Icons.Filled.SmartToy, if (subagents) "Sub-agents on" else "Sub-agents off",
+                    tint = if (subagents) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f))
             }
             Box {
                 IconButton(onClick = { repoMenu = true }) { Icon(Icons.Filled.Source, "Repos") }
@@ -434,14 +567,33 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
         if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
         if (todos.isNotEmpty()) PlanPanel(todos)
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(turns.size) { i -> TurnView(app, turns[i], enabled = !busy) { ok, reason -> decide(ok, reason) } }
+            items(turns.size) { i ->
+                TurnView(app, turns[i], enabled = !busy, activity = if (i == turns.size - 1) activity else null) { ok, reason -> decide(ok, reason) }
+            }
             error?.let { item { Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error) } }
         }
         Row(Modifier.padding(8.dp), verticalAlignment = Alignment.Bottom) {
             OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("Ask…") }, maxLines = 6)
-            IconButton(onClick = { send() }, enabled = !busy && input.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+            if (busy) IconButton(onClick = {
+                activity = "Stopping…"
+                app.run(null, { app.agent.cancel(id) }) { }
+            }) { Icon(Icons.Filled.Stop, "Stop", tint = MaterialTheme.colorScheme.error) }
+            else IconButton(onClick = { send() }, enabled = input.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
         }
     }
+}
+
+private fun tok(n: Int): String = when {
+    n >= 1_000_000 && n % 1_000_000 < 50_000 -> "${n / 1_000_000}M"
+    n >= 1_000_000 -> "%.1fM".format(n / 1_000_000.0)
+    n >= 1000 -> "${(n + 500) / 1000}k"
+    else -> "$n"
+}
+
+@Composable
+private fun Tag(text: String) {
+    Text(text, Modifier.padding(end = 6.dp).background(MaterialTheme.colorScheme.tertiaryContainer, RoundedCornerShape(4.dp))
+        .padding(horizontal = 4.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
 }
 
 @Composable
@@ -515,25 +667,28 @@ private fun RepoMenu(app: AppCtx, id: String, open: Boolean, workspace: List<Wor
 }
 
 @Composable
-private fun TurnView(app: AppCtx, t: Turn, enabled: Boolean, onDecide: (Boolean, String?) -> Unit) {
+private fun TurnView(app: AppCtx, t: Turn, enabled: Boolean, activity: String?, onDecide: (Boolean, String?) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Bubble(ChatItem.Msg("user", t.user))
         val liveText = t.live.toSortedMap().values.lastOrNull().orEmpty()
-        if (t.steps.isNotEmpty() || (!t.done && liveText.isBlank())) StepsDropdown(app, t.steps, running = !t.done)
+        if (t.steps.isNotEmpty() || (!t.done && liveText.isBlank())) StepsDropdown(app, t.steps, running = !t.done, activity = activity)
         t.approvals.forEach { ApprovalCard(it, enabled = enabled && it.state == "pending", onDecide = onDecide) }
         val shown = if (t.done) t.answer else liveText
         if (shown.isNotBlank()) Bubble(ChatItem.Msg("assistant", shown))
+        if (t.stopped) Text("Stopped", Modifier.padding(horizontal = 14.dp), style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
 /** All steps of one turn in a single collapsible box; header = the newest running step while the agent works. */
 @Composable
-private fun StepsDropdown(app: AppCtx, steps: List<ChatItem>, running: Boolean) {
+private fun StepsDropdown(app: AppCtx, steps: List<ChatItem>, running: Boolean, activity: String? = null) {
     var expanded by remember { mutableStateOf(false) }
     val boxes = steps.filterIsInstance<ChatItem.Step>()
     val current = boxes.lastOrNull { it.result == null }
     val failed = boxes.count { it.ok == false }
     val header = when {
+        running && activity != null -> activity
         running && current != null -> current.title.ifBlank { current.name }
         running -> "Thinking…"
         else -> "${boxes.size} step${if (boxes.size == 1) "" else "s"}" + (if (failed > 0) " · $failed failed" else "")

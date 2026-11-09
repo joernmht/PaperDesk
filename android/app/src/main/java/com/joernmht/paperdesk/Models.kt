@@ -160,10 +160,12 @@ val PAPER_TARGETS = listOf(
 )
 
 
-data class ChatThread(val id: String, val title: String, val updated: String, val model: String, val approvals: String = "auto") {
+data class ChatThread(val id: String, val title: String, val updated: String, val model: String, val approvals: String = "auto",
+                      val subagents: Boolean = true, val origin: String? = null, val running: Boolean = false, val lastSeq: Int = 0) {
     companion object {
         fun from(o: JSONObject) = ChatThread(o.optString("id"), o.optString("title"), o.optString("updated"), o.optString("model"),
-            o.optString("approvals", "auto"))
+            o.optString("approvals", "auto"), o.optBoolean("subagents", true),
+            o.optString("origin").takeIf { !o.isNull("origin") && it.isNotBlank() }, o.optBoolean("running"), o.optInt("last_seq"))
     }
 }
 

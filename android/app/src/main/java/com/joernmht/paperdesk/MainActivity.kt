@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handle(i: Intent?) {
         Tab.entries.firstOrNull { it.key == i?.getStringExtra(PollWorker.EXTRA_TAB) }?.let { tabState.value = it }
+        i?.getStringExtra(ChatNav.EXTRA_THREAD)?.let { ChatNav.open.value = it }
     }
 }
 

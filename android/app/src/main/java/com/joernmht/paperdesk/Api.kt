@@ -122,6 +122,8 @@ class Api(private val ctx: Context) {
 
 
 /** Client for the DeepAgent chat service; NDJSON streaming for answers. */
+class BusyException : Exception("this chat is still answering — wait a moment")
+
 class AgentApi(private val ctx: Context) {
     private fun open(path: String, method: String, timeoutMs: Int): HttpURLConnection {
         val c = URL(Prefs.agentUrl(ctx) + path).openConnection() as HttpURLConnection
@@ -168,8 +170,16 @@ class AgentApi(private val ctx: Context) {
 
     suspend fun detachRepo(id: String, name: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id/repos/$name", "DELETE") }
 
-    suspend fun newThread(model: String?, repos: List<Pair<String, String>> = emptyList(), approvals: String? = null) = withContext(Dispatchers.IO) {
+    suspend fun setSubagents(id: String, on: Boolean) = withContext(Dispatchers.IO) {
+        ChatThread.from(call("/api/agent/threads/$id", "PATCH", JSONObject().put("subagents", on)))
+    }
+
+    suspend fun cancel(id: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id/cancel", "POST") }
+
+    suspend fun newThread(model: String?, repos: List<Pair<String, String>> = emptyList(), approvals: String? = null,
+                          subagents: Boolean = true) = withContext(Dispatchers.IO) {
         val b = JSONObject().apply {
+            put("subagents", subagents)
             model?.let { put("model", it) }
             approvals?.let { put("approvals", it) }
             if (repos.isNotEmpty()) put("repos", org.json.JSONArray(repos.map { (r, m) -> JSONObject().put("repo", r).put("mode", m) }))
@@ -200,16 +210,23 @@ class AgentApi(private val ctx: Context) {
             JSONObject().put("decision", if (approve) "approve" else "reject").apply { message?.takeIf { it.isNotBlank() }?.let { put("message", it) } },
             onEvent)
 
-    /** Streams NDJSON (coding turns can run ~5 min); [onEvent] runs on the main thread for every line. */
-    private suspend fun stream(path: String, body: JSONObject, onEvent: (JSONObject) -> Unit) = withContext(Dispatchers.IO) {
-        val c = open(path, "POST", 600_000)
+    /** Replay events with seq > [since] (null = the latest run from its start), then follow the live run to done/error. */
+    suspend fun events(id: String, since: Int?, onEvent: (JSONObject) -> Unit) =
+        stream("/api/agent/threads/$id/events" + (since?.let { "?since=$it" } ?: ""), null, onEvent)
+
+    /** Streams NDJSON; [onEvent] runs on the main thread for every line. The server pings every 15 s, so a
+     *  90 s silence means the connection is dead (the run itself keeps going on the box). */
+    private suspend fun stream(path: String, body: JSONObject?, onEvent: (JSONObject) -> Unit) = withContext(Dispatchers.IO) {
+        val c = open(path, if (body == null) "GET" else "POST", 90_000)
         try {
-            c.doOutput = true
-            c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             c.setRequestProperty("Accept", "application/x-ndjson")
-            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            if (body != null) {
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
             val code = c.responseCode
-            if (code == 409) throw ApiException("this chat is still answering — wait a moment")
+            if (code == 409) throw BusyException()
             if (code !in 200..299) {
                 val err = c.errorStream?.bufferedReader()?.use { it.readText() }?.let { runCatching { JSONObject(it).optString("detail") }.getOrNull() }
                 throw ApiException("HTTP $code" + (err?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""))
