@@ -84,6 +84,10 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.FrontHand
+import androidx.compose.material.icons.filled.Public
+import androidx.compose.material3.FilterChip
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Source
 import androidx.compose.material3.AssistChip
@@ -124,6 +128,7 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
     val threads = remember { mutableStateListOf<ChatThread>() }
     val models = remember { mutableStateListOf<String>() }
     var defaultModel by remember { mutableStateOf("") }
+    var hosting by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var tick by remember { mutableStateOf(0) }
@@ -133,7 +138,11 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
     LaunchedEffect(reloadKey, tick) {
         loading = true
         try {
-            val (ms, def) = app.agent.health(); models.clear(); models.addAll(ms); defaultModel = def
+            val h = app.agent.healthRaw()
+            val arr = h.optJSONArray("models")
+            models.clear(); models.addAll((0 until (arr?.length() ?: 0)).map { arr!!.getString(it) }); defaultModel = h.optString("model")
+            hosting = listOfNotNull(h.optString("region").takeIf { it.isNotBlank() }?.let { "$it-hosted" },
+                h.optString("hosting").takeIf { it.isNotBlank() }).joinToString(" · ")
             val t = app.agent.threads(); threads.clear(); threads.addAll(t); error = null
         } catch (e: Exception) {
             error = e.message ?: e.javaClass.simpleName
@@ -144,6 +153,13 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
     Box(Modifier.fillMaxSize()) {
         PullToRefreshBox(isRefreshing = loading, onRefresh = { tick++ }, modifier = Modifier.fillMaxSize()) {
             LazyColumn(Modifier.fillMaxSize()) {
+                if (hosting.isNotBlank()) item {
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Public, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(6.dp))
+                        Text(hosting, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
                 error?.let { item { Text("Cannot reach the agent: $it", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } }
                 if (error == null && threads.isEmpty() && !loading) item { Text("No chats yet. Start one below.", Modifier.padding(16.dp)) }
                 items(threads, key = { it.id }) { t ->
@@ -161,9 +177,9 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp))
     }
 
-    if (setup) NewChatDialog(app, models, defaultModel, onDismiss = { setup = false }) { model, repos ->
+    if (setup) NewChatDialog(app, models, defaultModel, onDismiss = { setup = false }) { model, repos, approvals ->
         setup = false
-        app.run(null, { app.agent.newThread(model, repos) }) { onOpen(it.id) }
+        app.run(null, { app.agent.newThread(model, repos, approvals) }) { onOpen(it.id) }
     }
 
     delete?.let { t ->
@@ -204,7 +220,10 @@ private fun RepoPicker(app: AppCtx, chosen: MutableMap<String, String>, exclude:
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(on, onCheckedChange = { c -> if (!c) chosen.remove(r.repo) else { if (single) chosen.clear(); chosen[r.repo] = "read" } })
                         Column(Modifier.weight(1f)) {
-                            Text(r.repo.substringAfter('/'), style = MaterialTheme.typography.bodyMedium)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(r.repo.substringAfter('/'), style = MaterialTheme.typography.bodyMedium)
+                                if (r.onBox) OnBoxBadge()
+                            }
                             if (r.description.isNotBlank()) Text(r.description, style = MaterialTheme.typography.labelSmall, maxLines = 1,
                                 overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
@@ -225,8 +244,10 @@ private fun RepoPicker(app: AppCtx, chosen: MutableMap<String, String>, exclude:
 }
 
 @Composable
-private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: String, onDismiss: () -> Unit, onStart: (String?, List<Pair<String, String>>) -> Unit) {
+private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: String, onDismiss: () -> Unit,
+                          onStart: (String?, List<Pair<String, String>>, String) -> Unit) {
     var model by remember { mutableStateOf(defaultModel) }
+    var ask by remember { mutableStateOf(false) }
     var modelMenu by remember { mutableStateOf(false) }
     val chosen = remember { mutableStateMapOf<String, String>() }
     AlertDialog(
@@ -240,12 +261,17 @@ private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: Strin
                         models.forEach { m -> DropdownMenuItem(text = { Text(m.substringAfter('/')) }, onClick = { model = m; modelMenu = false }) }
                     }
                 }
+                Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Switch(ask, onCheckedChange = { ask = it })
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (ask) "Ask me before writes (PRs, comments)" else "Writes run automatically", style = MaterialTheme.typography.labelMedium)
+                }
                 Text("Repos (optional; read-only unless you switch on write)", style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
                 RepoPicker(app, chosen)
             }
         },
-        confirmButton = { TextButton(onClick = { onStart(model.ifBlank { null }, chosen.map { it.key to it.value }) }) { Text("Start") } },
+        confirmButton = { TextButton(onClick = { onStart(model.ifBlank { null }, chosen.map { it.key to it.value }, if (ask) "ask" else "auto") }) { Text("Start") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -301,12 +327,13 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
     var input by rememberSaveable { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    var attach by remember { mutableStateOf(false) }
+    var repoMenu by remember { mutableStateOf(false) }
+    var approvals by remember { mutableStateOf("auto") }
     val list = rememberLazyListState()
 
     suspend fun reload() {
         val r = app.agent.thread(id)
-        val t = ChatThread.from(r); title = t.title; model = t.model
+        val t = ChatThread.from(r); title = t.title; model = t.model; approvals = t.approvals
         turns.clear(); turns.addAll(turnsFromHistory(r) { l -> todos = l })
         workspace.clear(); workspace.addAll(parseWorkspace(r))
     }
@@ -382,12 +409,25 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
                 if (model.isNotBlank()) Text(model.substringAfter('/'), style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            IconButton(onClick = { attach = true }) { Icon(Icons.Filled.Source, "Attach repo") }
+            TextButton(onClick = {
+                val next = if (approvals == "ask") "auto" else "ask"
+                app.run(if (next == "ask") "Will ask before writes" else "Writes run automatically",
+                    { app.agent.setApprovals(id, next) }) { approvals = it.approvals }
+            }) {
+                Icon(if (approvals == "ask") Icons.Filled.FrontHand else Icons.Filled.Bolt, null, Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(if (approvals == "ask") "Ask" else "Auto", style = MaterialTheme.typography.labelMedium)
+            }
+            Box {
+                IconButton(onClick = { repoMenu = true }) { Icon(Icons.Filled.Source, "Repos") }
+                RepoMenu(app, id, repoMenu, workspace, onDismiss = { repoMenu = false }) { ws -> workspace.clear(); workspace.addAll(ws) }
+            }
         }
         if (workspace.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             workspace.forEach { w ->
-                AssistChip(onClick = {}, label = { Text(w.repo.substringAfter('/') + if (w.mode == "write") " · write" else " · read") },
+                AssistChip(onClick = { repoMenu = true },
+                    label = { Text(w.name + (if (w.mode == "write") " · write" else " · read") + (if (w.source.startsWith("box")) " · box" else "")) },
                     leadingIcon = { Icon(if (w.mode == "write") Icons.Filled.Edit else Icons.Filled.Lock, null, Modifier.size(16.dp)) })
             }
         }
@@ -402,23 +442,74 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
             IconButton(onClick = { send() }, enabled = !busy && input.isNotBlank()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
         }
     }
+}
 
-    if (attach) {
-        val chosen = remember { mutableStateMapOf<String, String>() }
-        AlertDialog(
-            onDismissRequest = { attach = false },
-            title = { Text("Attach a repo") },
-            text = { RepoPicker(app, chosen, exclude = workspace.map { it.repo }.toSet(), single = true) },
-            confirmButton = {
-                TextButton(enabled = chosen.isNotEmpty(), onClick = {
-                    val (repo, mode) = chosen.entries.first().toPair()
-                    attach = false
-                    app.run("Attached ${repo.substringAfter('/')} ($mode)", { app.agent.attachRepo(id, repo, mode) }) { r ->
-                        workspace.clear(); workspace.addAll(parseWorkspace(r))
+@Composable
+private fun OnBoxBadge() {
+    Text("on box", Modifier.padding(start = 6.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(4.dp))
+        .padding(horizontal = 4.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
+}
+
+/** In-chat repo dropdown: every repo with Off / Read / Write; changes attach or detach right away. */
+@Composable
+private fun RepoMenu(app: AppCtx, id: String, open: Boolean, workspace: List<WorkspaceRepo>, onDismiss: () -> Unit, onWorkspace: (List<WorkspaceRepo>) -> Unit) {
+    val repos = remember { mutableStateListOf<RepoInfo>() }
+    var filter by remember { mutableStateOf("") }
+    var confirmDrop by remember { mutableStateOf<Pair<WorkspaceRepo, String?>?>(null) }
+    LaunchedEffect(open) { if (open && repos.isEmpty()) try { repos.addAll(app.agent.repos()) } catch (_: Exception) {} }
+
+    fun set(r: RepoInfo, mode: String?) {
+        val cur = workspace.firstOrNull { it.repo == r.repo }
+        if (cur?.mode == mode) return
+        if (cur != null && cur.mode == "write") { confirmDrop = cur to mode; return }
+        app.run(null, {
+            if (cur != null) app.agent.detachRepo(id, cur.name)
+            if (mode != null) app.agent.attachRepo(id, r.repo, mode) else app.agent.thread(id)
+        }) { onWorkspace(parseWorkspace(it)) }
+    }
+
+    DropdownMenu(expanded = open, onDismissRequest = onDismiss, modifier = Modifier.widthIn(min = 300.dp)) {
+        OutlinedTextField(filter, { filter = it }, Modifier.padding(horizontal = 8.dp).fillMaxWidth(), placeholder = { Text("Filter repos") }, singleLine = true)
+        val attached = workspace.map { it.repo }.toSet()
+        repos.filter { filter.isBlank() || it.repo.contains(filter, true) }
+            .sortedWith(compareByDescending<RepoInfo> { it.repo in attached }.thenByDescending { it.onBox })
+            .forEach { r ->
+                val w = workspace.firstOrNull { it.repo == r.repo }
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(r.repo.substringAfter('/'), style = MaterialTheme.typography.bodyMedium, fontWeight = if (w != null) FontWeight.SemiBold else FontWeight.Normal)
+                        if (r.onBox) OnBoxBadge()
                     }
-                }) { Text("Attach") }
+                    if (w != null && (w.masked > 0 || w.source.isNotBlank()))
+                        Text(listOfNotNull("from ${w.source}".takeIf { w.source.isNotBlank() },
+                            "${w.masked} secret file${if (w.masked == 1) "" else "s"} blanked".takeIf { w.masked > 0 }).joinToString(" · "),
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(null to "Off", "read" to "Read", "write" to "Write").forEach { (mode, label) ->
+                            FilterChip(selected = w?.mode == mode, onClick = { set(r, mode) }, label = { Text(label) },
+                                enabled = mode != "write" || r.writable)
+                        }
+                    }
+                }
+            }
+        if (repos.isEmpty()) Text("Loading repos…", Modifier.padding(12.dp))
+    }
+
+    confirmDrop?.let { (w, mode) ->
+        AlertDialog(
+            onDismissRequest = { confirmDrop = null },
+            title = { Text("Drop the writable copy of ${w.name}?") },
+            text = { Text("Work the agent has not pushed yet is lost.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDrop = null
+                    app.run(null, {
+                        app.agent.detachRepo(id, w.name)
+                        if (mode != null) app.agent.attachRepo(id, w.repo, mode) else app.agent.thread(id)
+                    }) { onWorkspace(parseWorkspace(it)) }
+                }) { Text("Drop") }
             },
-            dismissButton = { TextButton(onClick = { attach = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { confirmDrop = null }) { Text("Cancel") } },
         )
     }
 }
@@ -516,7 +607,7 @@ private fun StepBox(app: AppCtx, s: ChatItem.Step) {
                 Text(s.title.ifBlank { s.name }, maxLines = if (expanded) 4 else 1, overflow = TextOverflow.Ellipsis,
                     fontFamily = if (s.kind == "shell") FontFamily.Monospace else FontFamily.Default,
                     style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
-                Text(listOfNotNull(s.kind, s.name.takeIf { it != s.kind }, s.exitCode?.let { "exit $it" }).joinToString(" · "),
+                Text(listOfNotNull(s.kind, s.name.takeIf { it != s.kind }, s.exitCode?.let { "exit $it" }, "auto-approved".takeIf { s.autoApproved }).joinToString(" · "),
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             when {

@@ -160,9 +160,18 @@ class AgentApi(private val ctx: Context) {
 
     suspend fun threads() = withContext(Dispatchers.IO) { call("/api/agent/threads").optJSONArray("threads").mapObjects(ChatThread::from) }
 
-    suspend fun newThread(model: String?, repos: List<Pair<String, String>> = emptyList()) = withContext(Dispatchers.IO) {
+    suspend fun healthRaw() = withContext(Dispatchers.IO) { call("/api/agent/health") }
+
+    suspend fun setApprovals(id: String, mode: String) = withContext(Dispatchers.IO) {
+        ChatThread.from(call("/api/agent/threads/$id", "PATCH", JSONObject().put("approvals", mode)))
+    }
+
+    suspend fun detachRepo(id: String, name: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id/repos/$name", "DELETE") }
+
+    suspend fun newThread(model: String?, repos: List<Pair<String, String>> = emptyList(), approvals: String? = null) = withContext(Dispatchers.IO) {
         val b = JSONObject().apply {
             model?.let { put("model", it) }
+            approvals?.let { put("approvals", it) }
             if (repos.isNotEmpty()) put("repos", org.json.JSONArray(repos.map { (r, m) -> JSONObject().put("repo", r).put("mode", m) }))
         }
         ChatThread.from(call("/api/agent/threads", "POST", b))
@@ -170,7 +179,7 @@ class AgentApi(private val ctx: Context) {
 
     suspend fun repos() = withContext(Dispatchers.IO) {
         call("/api/agent/repos").optJSONArray("repos").mapObjects {
-            RepoInfo(it.optString("repo"), it.optString("description"), it.optBoolean("private"), it.optBoolean("writable"))
+            RepoInfo(it.optString("repo"), it.optString("description"), it.optBoolean("private"), it.optBoolean("writable"), it.optBoolean("on_box"))
         }
     }
 

@@ -160,9 +160,10 @@ val PAPER_TARGETS = listOf(
 )
 
 
-data class ChatThread(val id: String, val title: String, val updated: String, val model: String) {
+data class ChatThread(val id: String, val title: String, val updated: String, val model: String, val approvals: String = "auto") {
     companion object {
-        fun from(o: JSONObject) = ChatThread(o.optString("id"), o.optString("title"), o.optString("updated"), o.optString("model"))
+        fun from(o: JSONObject) = ChatThread(o.optString("id"), o.optString("title"), o.optString("updated"), o.optString("model"),
+            o.optString("approvals", "auto"))
     }
 }
 
@@ -172,16 +173,23 @@ sealed class ChatItem {
     data class Step(
         val id: String, val name: String, val kind: String, val title: String, val args: String,
         val result: String? = null, val ok: Boolean? = null, val exitCode: Int? = null, val url: String? = null,
+        val autoApproved: Boolean = false,
     ) : ChatItem()
     data class Approval(val id: String, val text: String, val actions: List<ApprovalAction>, val state: String = "pending") : ChatItem()
 }
 
-data class RepoInfo(val repo: String, val description: String, val private: Boolean, val writable: Boolean)
+data class RepoInfo(val repo: String, val description: String, val private: Boolean, val writable: Boolean, val onBox: Boolean = false)
 
-data class WorkspaceRepo(val repo: String, val mode: String, val branch: String?)
+/** source = box | github | box+github; masked = secret files blanked in a box mount */
+data class WorkspaceRepo(val repo: String, val mode: String, val branch: String?, val source: String = "", val masked: Int = 0) {
+    val name get() = repo.substringAfter('/')
+}
 
 fun parseWorkspace(o: JSONObject): List<WorkspaceRepo> =
-    o.optJSONArray("workspace").mapObjects { WorkspaceRepo(it.optString("repo"), it.optString("mode", "read"), it.str("branch")) }
+    o.optJSONArray("workspace").mapObjects {
+        WorkspaceRepo(it.optString("repo"), it.optString("mode", "read"), it.str("branch"), it.optString("source"),
+            it.optJSONArray("masked")?.length() ?: 0)
+    }
 
 data class ApprovalAction(val name: String, val kind: String, val title: String, val args: List<Pair<String, String>>)
 
@@ -203,6 +211,7 @@ fun stepFromCall(o: JSONObject) = ChatItem.Step(
     id = o.optString("id"), name = o.optString("name"), kind = o.optString("kind", "tool"),
     title = o.optString("title").ifBlank { o.optString("text").take(120) },
     args = argsText(o.opt("args")).ifBlank { o.optString("text") },
+    autoApproved = o.optBoolean("auto_approved", false),
 )
 
 fun ChatItem.Step.withResult(o: JSONObject) = copy(
