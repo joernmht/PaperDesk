@@ -78,6 +78,11 @@ class Api(private val ctx: Context) {
         return r.optJSONArray("library").mapObjects(Paper::from) to r.optJSONArray("web").mapObjects(Paper::from)
     }
 
+    suspend fun decisions(): Pair<List<Decision>, String> {
+        val r = get("/api/decisions")
+        return r.optJSONArray("decisions").mapObjects(Decision::from) to decisionStats(r.optJSONObject("stats"))
+    }
+
     suspend fun jobs() = get("/api/jobs").optJSONArray("jobs").mapObjects(Job::from)
     suspend fun job(id: String) = Job.from(get("/api/jobs/${enc(id)}"))
     suspend fun events(since: Int): Pair<List<Event>, Int> {

@@ -110,22 +110,23 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 6.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp),
                 verticalArrangement = Arrangement.Center) {
-                FilledTonalButton(onClick = { act("literature") }, enabled = !p.inCorpus,
-                    contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Add to literature") }
                 FilledTonalButton(onClick = { pickTarget = true }, contentPadding = PaddingValues(horizontal = 12.dp)) {
-                    Text("Include in paper")
+                    Text("Include in…")
                 }
                 OutlinedButton(onClick = { act("remarkable") }, contentPadding = PaddingValues(horizontal = 12.dp)) {
                     Text("Send to reMarkable")
                 }
+                if (p.status == "dismissed")
+                    TextButton(onClick = { act("restore", label = "Restored") }) { Text("Restore") }
+                else
+                    TextButton(onClick = { act("dismiss", label = "Dismissed") }) { Text("Dismiss") }
                 Box {
                     IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Add + to read (reMarkable)") }, enabled = !p.inCorpus,
+                        DropdownMenuItem(text = { Text("Literature base + to read (reMarkable)") }, enabled = !p.inCorpus,
                             onClick = { menu = false; act("literature", toread = true) })
                         DropdownMenuItem(text = { Text("Later") }, onClick = { menu = false; act("later", label = "Moved to later") })
-                        DropdownMenuItem(text = { Text("Dismiss") }, onClick = { menu = false; act("dismiss", label = "Dismissed") })
-                        if (p.status == "dismissed" || p.status == "later")
+                        if (p.status == "later")
                             DropdownMenuItem(text = { Text("Restore") }, onClick = { menu = false; act("restore", label = "Restored") })
                     }
                 }
@@ -135,13 +136,19 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
 
     if (pickTarget) AlertDialog(
         onDismissRequest = { pickTarget = false },
-        title = { Text("Include in which paper?") },
+        title = { Text("Include in…") },
         text = {
             Column {
-                Text("Adds it to the literature if needed and queues a cite note for that paper's session.",
+                Text("Including it in a paper also adds it to the literature base, and queues a cite task for that paper's session.",
                     style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { pickTarget = false; act("literature") }, enabled = !p.inCorpus) {
+                    Text(if (p.inCorpus) "Literature base (already in: ${p.bibkey ?: "yes"})" else "Literature base only")
+                }
                 PAPER_TARGETS.forEach { (pid, label) ->
-                    TextButton(onClick = { pickTarget = false; act("include", target = pid) }) { Text(label) }
+                    val done = pid in p.targets
+                    TextButton(onClick = { pickTarget = false; act("include", target = pid) }, enabled = !done) {
+                        Text(if (done) "$label (already)" else label)
+                    }
                 }
             }
         },

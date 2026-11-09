@@ -113,6 +113,31 @@ def events_since(since: int) -> dict:
     return {"events": out[-200:], "last": last}
 
 
+DECISIONS = STATE_DIR / "decisions.jsonl"
+
+
+def log_decision(item: dict, action: str, target: str | None = None) -> None:
+    """Append-only record of Joern's choices (feeds the app's history and the scout loops' taste)."""
+    rec = {"ts": now(), "id": item["id"], "title": item["title"], "action": action, "target": target,
+           "source": item.get("source"), "cat": item.get("cat"), "run": item.get("run"), "why": item.get("why"),
+           "doi": item.get("doi"), "arxiv": item.get("arxiv")}
+    with LOCK, DECISIONS.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def decisions(n: int = 300) -> dict:
+    recs = [json.loads(l) for l in DECISIONS.read_text().splitlines() if l.strip()] if DECISIONS.exists() else []
+    stats = {"dismissed": 0, "literature": 0, "remarkable": 0, "later": 0, "include": {k: 0 for k in PAPERS}}
+    for r in recs:
+        if r["action"] == "include" and r.get("target") in stats["include"]:
+            stats["include"][r["target"]] += 1
+        elif r["action"] == "dismiss":
+            stats["dismissed"] += 1
+        elif r["action"] in stats:
+            stats[r["action"]] += 1
+    return {"decisions": recs[::-1][:n], "stats": stats}
+
+
 # ------------------------------------------------------------------ papers
 def norm_title(t: str) -> str:
     return pc.norm_title(t)
@@ -719,6 +744,8 @@ def do_action(body: dict) -> dict:
     item = enrich(paper, st)
     prev = item["status"]
     job = None
+    if action in ("dismiss", "later", "restore", "literature", "include", "remarkable"):
+        log_decision(item, action, body.get("target") if action == "include" else None)
     if action in ("dismiss", "later", "restore"):
         set_item(pid, paper, status={"dismiss": "dismissed", "later": "later", "restore": "new"}[action])
     elif action in ("literature", "include"):
@@ -862,6 +889,8 @@ class H(BaseHTTPRequestHandler):
                     lib = search_library(text) if scope in ("library", "all") else []
                     web = search_web(text) if scope in ("web", "all") else []
                     return self._send(200, {"library": lib, "web": web})
+                if p == "/api/decisions":
+                    return self._send(200, decisions())
                 if p == "/api/jobs":
                     return self._send(200, {"jobs": list_jobs()})
                 if p.startswith("/api/jobs/"):

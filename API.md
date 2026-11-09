@@ -32,6 +32,7 @@ Event = { seq: int, ts: str, kind: str, title: str, body: str, ref: str|null }
     paper's session), `"remarkable"` (send PDF to `/Papers/To read`), `"dismiss"`, `"later"`, `"restore"`.
   - `paper` = the full Paper object when the id is not in the inbox (search results).
 - `GET  /api/search?q=<text>&scope=library|web|all` → `{library: [Paper], web: [Paper]}`
+- `GET  /api/decisions` → `{decisions: [{ts, id, title, action, target, source, cat, run, why, doi, arxiv}], stats: {dismissed, literature, remarkable, later, include: {p0..p3}}}` (newest first; append-only log `~/.local/state/paperdesk/decisions.jsonl`, also read by the scout loops)
 - `GET  /api/jobs` → `{jobs: [Job]}` (newest first, last 50); `GET /api/jobs/<id>` → `Job` with longer `log_tail`
 - `GET  /api/events?since=<seq>` → `{events: [Event], last: int}` (since=0 → last 30 only)
 - reMarkable

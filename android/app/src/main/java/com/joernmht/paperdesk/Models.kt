@@ -95,6 +95,31 @@ data class Event(val seq: Int, val ts: String, val kind: String, val title: Stri
     }
 }
 
+data class Decision(val ts: String, val title: String, val action: String, val target: String?) {
+    val label get() = when (action) {
+        "include" -> "Included in ${target?.uppercase()}"
+        "literature" -> "Added to literature base"
+        "dismiss" -> "Dismissed"
+        "remarkable" -> "Sent to reMarkable"
+        "later" -> "Later"
+        "restore" -> "Restored"
+        else -> action
+    }
+    companion object {
+        fun from(o: JSONObject) = Decision(o.optString("ts"), o.optString("title"), o.optString("action"), o.str("target"))
+    }
+}
+
+/** One-line summary of /api/decisions stats. */
+fun decisionStats(o: JSONObject?): String {
+    if (o == null) return ""
+    val inc = o.optJSONObject("include")
+    val perPaper = PAPER_TARGETS.mapNotNull { (pid, _) -> inc?.optInt(pid, 0)?.takeIf { it > 0 }?.let { "${pid.uppercase()} $it" } }
+    val incTotal = PAPER_TARGETS.sumOf { (pid, _) -> inc?.optInt(pid, 0) ?: 0 }
+    return "Included $incTotal" + (if (perPaper.isNotEmpty()) " (" + perPaper.joinToString(", ") + ")" else "") +
+        " · literature ${o.optInt("literature")} · dismissed ${o.optInt("dismissed")} · reMarkable ${o.optInt("remarkable")}"
+}
+
 data class RmEntry(val name: String, val type: String, val path: String) {
     val isDir get() = type == "d"
 }

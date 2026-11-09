@@ -1,5 +1,7 @@
 package com.joernmht.paperdesk.ui
 
+import com.joernmht.paperdesk.Decision
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -223,6 +225,9 @@ private fun RmRow(e: RmEntry, onOpen: () -> Unit, onPull: () -> Unit, onArchive:
 fun ActivityScreen(app: AppCtx, reloadKey: Int) {
     val jobs = remember { mutableStateListOf<Job>() }
     val events = remember { mutableStateListOf<Event>() }
+    val decisions = remember { mutableStateListOf<Decision>() }
+    var stats by remember { mutableStateOf("") }
+    var showAllDecisions by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var tick by remember { mutableStateOf(0) }
@@ -232,6 +237,7 @@ fun ActivityScreen(app: AppCtx, reloadKey: Int) {
         try {
             val j = app.api.jobs(); jobs.clear(); jobs.addAll(j)
             val (ev, _) = app.api.events(0); events.clear(); events.addAll(ev.sortedByDescending { it.seq })
+            val (ds, st) = app.api.decisions(); decisions.clear(); decisions.addAll(ds); stats = st
             error = null
         } catch (e: Exception) {
             error = e.message ?: e.javaClass.simpleName
@@ -269,6 +275,20 @@ fun ActivityScreen(app: AppCtx, reloadKey: Int) {
                         app.run(null, { app.api.job(j.id) }) { shown = it }
                     },
                 )
+            }
+            item { HorizontalDivider(Modifier.padding(top = 8.dp)); Header("Decisions") }
+            if (stats.isNotBlank()) item { Text(stats, Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
+            if (decisions.isEmpty()) item { Text("No decisions yet.", Modifier.padding(16.dp)) }
+            items(if (showAllDecisions) decisions else decisions.take(8), key = { "d:" + it.ts + it.title + it.action }) { d ->
+                ListItem(
+                    overlineContent = { Text("${d.label} · ${d.ts.replace('T', ' ').take(16)}") },
+                    headlineContent = { Text(d.title, maxLines = 2) },
+                )
+            }
+            if (decisions.size > 8 && !showAllDecisions) item {
+                TextButton(onClick = { showAllDecisions = true }, modifier = Modifier.padding(horizontal = 8.dp)) {
+                    Text("Show all ${decisions.size}")
+                }
             }
             item { HorizontalDivider(Modifier.padding(top = 8.dp)); Header("Updates") }
             if (events.isEmpty()) item { Text("No updates yet.", Modifier.padding(16.dp)) }
