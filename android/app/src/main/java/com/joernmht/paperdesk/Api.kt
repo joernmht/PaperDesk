@@ -166,26 +166,38 @@ class AgentApi(private val ctx: Context) {
 
     suspend fun deleteThread(id: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id", "DELETE") }
 
-    suspend fun thread(id: String): Pair<ChatThread, List<ChatMsg>> = withContext(Dispatchers.IO) {
+    /** (thread, raw history rows, pending approval events) */
+    suspend fun thread(id: String): Triple<ChatThread, List<JSONObject>, List<JSONObject>> = withContext(Dispatchers.IO) {
         val r = call("/api/agent/threads/$id")
-        ChatThread.from(r) to r.optJSONArray("messages").mapObjects(ChatMsg::from)
+        Triple(ChatThread.from(r), r.optJSONArray("messages").mapObjects { it }, r.optJSONArray("pending_approvals").mapObjects { it })
     }
 
-    /** Streams one answer; [onEvent] runs on the main thread for every NDJSON line. */
-    suspend fun chat(id: String, text: String, onEvent: (ChatEvent) -> Unit) = withContext(Dispatchers.IO) {
-        val c = open("/api/agent/threads/$id/chat", "POST", 300_000)
+    suspend fun chat(id: String, text: String, onEvent: (JSONObject) -> Unit) =
+        stream("/api/agent/threads/$id/chat", JSONObject().put("text", text), onEvent)
+
+    suspend fun resume(id: String, approve: Boolean, message: String?, onEvent: (JSONObject) -> Unit) =
+        stream("/api/agent/threads/$id/resume",
+            JSONObject().put("decision", if (approve) "approve" else "reject").apply { message?.takeIf { it.isNotBlank() }?.let { put("message", it) } },
+            onEvent)
+
+    /** Streams NDJSON (coding turns can run ~5 min); [onEvent] runs on the main thread for every line. */
+    private suspend fun stream(path: String, body: JSONObject, onEvent: (JSONObject) -> Unit) = withContext(Dispatchers.IO) {
+        val c = open(path, "POST", 600_000)
         try {
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             c.setRequestProperty("Accept", "application/x-ndjson")
-            c.outputStream.use { it.write(JSONObject().put("text", text).toString().toByteArray(Charsets.UTF_8)) }
+            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = c.responseCode
             if (code == 409) throw ApiException("this chat is still answering — wait a moment")
-            if (code !in 200..299) throw ApiException("HTTP $code")
+            if (code !in 200..299) {
+                val err = c.errorStream?.bufferedReader()?.use { it.readText() }?.let { runCatching { JSONObject(it).optString("detail") }.getOrNull() }
+                throw ApiException("HTTP $code" + (err?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""))
+            }
             c.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
                 for (line in lines) {
                     if (line.isBlank()) continue
-                    val ev = runCatching { ChatEvent.from(JSONObject(line)) }.getOrNull() ?: continue
+                    val ev = runCatching { JSONObject(line) }.getOrNull() ?: continue
                     withContext(Dispatchers.Main) { onEvent(ev) }
                 }
             }

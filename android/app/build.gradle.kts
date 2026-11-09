@@ -18,8 +18,8 @@ android {
         applicationId = "com.joernmht.paperdesk"
         minSdk = 33
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.6"
+        versionCode = 7
+        versionName = "0.7"
         // Baked in from android/local.properties (never committed); overridable in Settings.
         buildConfigField("String", "DEFAULT_URL", "\"${lp("paperdesk.url", "https://paper1.tailbf37ab.ts.net:8447")}\"")
         buildConfigField("String", "DEFAULT_TOKEN", "\"${lp("paperdesk.token", "")}\"")
@@ -49,4 +49,6 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
+    // Markdown in chat answers; 0.35.0 = last release built with Kotlin 2.1 (the project uses Kotlin 2.2.10)
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.35.0")
 }

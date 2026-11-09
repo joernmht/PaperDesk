@@ -166,15 +166,47 @@ data class ChatThread(val id: String, val title: String, val updated: String, va
     }
 }
 
-/** role: user | assistant | tool_call | tool_result */
-data class ChatMsg(val role: String, val text: String, val name: String? = null) {
-    companion object {
-        fun from(o: JSONObject) = ChatMsg(o.optString("role"), o.optString("text"), o.str("name"))
-    }
+/** One row in a chat: a message, an agent step (tool_call + its tool_result, paired by id) or an approval request. */
+sealed class ChatItem {
+    data class Msg(val role: String, val text: String) : ChatItem()
+    data class Step(
+        val id: String, val name: String, val kind: String, val title: String, val args: String,
+        val result: String? = null, val ok: Boolean? = null, val exitCode: Int? = null, val url: String? = null,
+    ) : ChatItem()
+    data class Approval(val id: String, val text: String, val actions: List<ApprovalAction>, val state: String = "pending") : ChatItem()
 }
 
-data class ChatEvent(val type: String, val text: String, val name: String?) {
-    companion object {
-        fun from(o: JSONObject) = ChatEvent(o.optString("type"), o.optString("text"), o.str("name"))
-    }
+data class ApprovalAction(val name: String, val kind: String, val title: String, val args: List<Pair<String, String>>)
+
+data class TodoItem(val content: String, val status: String)
+
+private fun argsText(o: Any?): String = when (o) {
+    is JSONObject -> o.toString(2)
+    null -> ""
+    else -> o.toString()
 }
+
+private fun argPairs(o: JSONObject?): List<Pair<String, String>> =
+    o?.keys()?.asSequence()?.map { k -> k to (o.opt(k)?.let { if (it is JSONObject || it is org.json.JSONArray) it.toString() else it.toString() } ?: "") }?.toList() ?: emptyList()
+
+fun parseTodos(o: JSONObject): List<TodoItem> =
+    o.optJSONArray("items").mapObjects { TodoItem(it.optString("content"), it.optString("status")) }
+
+fun stepFromCall(o: JSONObject) = ChatItem.Step(
+    id = o.optString("id"), name = o.optString("name"), kind = o.optString("kind", "tool"),
+    title = o.optString("title").ifBlank { o.optString("text").take(120) },
+    args = argsText(o.opt("args")).ifBlank { o.optString("text") },
+)
+
+fun ChatItem.Step.withResult(o: JSONObject) = copy(
+    result = o.optString("text"), ok = if (o.has("ok")) o.optBoolean("ok") else true,
+    exitCode = if (o.has("exit_code") && !o.isNull("exit_code")) o.optInt("exit_code") else null,
+    url = o.str("url"),
+)
+
+fun approvalFrom(o: JSONObject) = ChatItem.Approval(
+    id = o.optString("id"), text = o.optString("text"),
+    actions = o.optJSONArray("actions").mapObjects {
+        ApprovalAction(it.optString("name"), it.optString("kind"), it.optString("title"), argPairs(it.optJSONObject("args")))
+    },
+)
