@@ -17,6 +17,9 @@ object Prefs {
     fun url(ctx: Context): String = (sp(ctx).getString("url", null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEFAULT_URL).trimEnd('/')
     fun token(ctx: Context): String = sp(ctx).getString("token", null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEFAULT_TOKEN
     fun save(ctx: Context, url: String, token: String) = sp(ctx).edit().putString("url", url.trim()).putString("token", token.trim()).apply()
+    /** Chat agent (~/PaperDesk/agent): same host, port 8448 instead of 8447, unless overridden. */
+    fun agentUrl(ctx: Context): String = sp(ctx).getString("agent_url", null)?.takeIf { it.isNotBlank() }?.trimEnd('/')
+        ?: url(ctx).replace(":8447", ":8448")
     fun lastSeq(ctx: Context): Int = sp(ctx).getInt("last_seq", -1)
     fun setLastSeq(ctx: Context, v: Int) = sp(ctx).edit().putInt("last_seq", v).apply()
 }
@@ -115,4 +118,79 @@ class Api(private val ctx: Context) {
     }
 
     fun apkUrl() = "$base/download/paperdesk.apk"
+}
+
+
+/** Client for the DeepAgent chat service; NDJSON streaming for answers. */
+class AgentApi(private val ctx: Context) {
+    private fun open(path: String, method: String, timeoutMs: Int): HttpURLConnection {
+        val c = URL(Prefs.agentUrl(ctx) + path).openConnection() as HttpURLConnection
+        c.requestMethod = method
+        c.connectTimeout = 15_000
+        c.readTimeout = timeoutMs
+        c.setRequestProperty("Authorization", "Bearer " + Prefs.token(ctx))
+        return c
+    }
+
+    private fun call(path: String, method: String = "GET", body: JSONObject? = null): JSONObject {
+        val c = open(path, method, 30_000)
+        try {
+            if (body != null) {
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
+            val code = c.responseCode
+            val text = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+            if (code !in 200..299) {
+                val err = runCatching { JSONObject(text).optString("detail") }.getOrNull()
+                throw ApiException("HTTP $code" + (err?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""))
+            }
+            return if (text.isBlank()) JSONObject() else JSONObject(text)
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    suspend fun health(): Pair<List<String>, String> = withContext(Dispatchers.IO) {
+        val r = call("/api/agent/health")
+        val arr = r.optJSONArray("models")
+        (0 until (arr?.length() ?: 0)).map { arr!!.getString(it) } to r.optString("model")
+    }
+
+    suspend fun threads() = withContext(Dispatchers.IO) { call("/api/agent/threads").optJSONArray("threads").mapObjects(ChatThread::from) }
+
+    suspend fun newThread(model: String?) = withContext(Dispatchers.IO) {
+        ChatThread.from(call("/api/agent/threads", "POST", JSONObject().apply { model?.let { put("model", it) } }))
+    }
+
+    suspend fun deleteThread(id: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id", "DELETE") }
+
+    suspend fun thread(id: String): Pair<ChatThread, List<ChatMsg>> = withContext(Dispatchers.IO) {
+        val r = call("/api/agent/threads/$id")
+        ChatThread.from(r) to r.optJSONArray("messages").mapObjects(ChatMsg::from)
+    }
+
+    /** Streams one answer; [onEvent] runs on the main thread for every NDJSON line. */
+    suspend fun chat(id: String, text: String, onEvent: (ChatEvent) -> Unit) = withContext(Dispatchers.IO) {
+        val c = open("/api/agent/threads/$id/chat", "POST", 300_000)
+        try {
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            c.setRequestProperty("Accept", "application/x-ndjson")
+            c.outputStream.use { it.write(JSONObject().put("text", text).toString().toByteArray(Charsets.UTF_8)) }
+            val code = c.responseCode
+            if (code == 409) throw ApiException("this chat is still answering — wait a moment")
+            if (code !in 200..299) throw ApiException("HTTP $code")
+            c.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    val ev = runCatching { ChatEvent.from(JSONObject(line)) }.getOrNull() ?: continue
+                    withContext(Dispatchers.Main) { onEvent(ev) }
+                }
+            }
+        } finally {
+            c.disconnect()
+        }
+    }
 }

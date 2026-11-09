@@ -17,6 +17,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -50,6 +51,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.joernmht.paperdesk.ui.ActivityScreen
+import com.joernmht.paperdesk.ui.ChatScreen
 import com.joernmht.paperdesk.ui.InboxScreen
 import com.joernmht.paperdesk.ui.RemarkableScreen
 import com.joernmht.paperdesk.ui.SearchScreen
@@ -58,7 +60,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 /** Shared helpers handed to every screen. */
-class AppCtx(val ctx: Context, val api: Api, val snackbar: SnackbarHostState, val scope: CoroutineScope) {
+class AppCtx(val ctx: Context, val api: Api, val agent: AgentApi, val snackbar: SnackbarHostState, val scope: CoroutineScope) {
     fun toast(msg: String) { scope.launch { snackbar.showSnackbar(msg) } }
 
     /** Runs a server call, shows errors as a snackbar; a started job triggers the quick-poll burst. */
@@ -109,6 +111,7 @@ enum class Tab(val key: String, val label: String, val icon: ImageVector) {
     Inbox("inbox", "Inbox", Icons.Filled.Inbox),
     Search("search", "Search", Icons.Filled.Search),
     Remarkable("remarkable", "reMarkable", Icons.Filled.Edit),
+    Chat("chat", "Chat", Icons.Filled.Forum),
     Activity("activity", "Activity", Icons.AutoMirrored.Filled.List),
 }
 
@@ -151,7 +154,7 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>) {
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var settingsVersion by remember { mutableStateOf(0) }   // bump → screens reload with new prefs
-    val app = remember(settingsVersion) { AppCtx(ctx.applicationContext, Api(ctx.applicationContext), snackbar, scope) }
+    val app = remember(settingsVersion) { AppCtx(ctx.applicationContext, Api(ctx.applicationContext), AgentApi(ctx.applicationContext), snackbar, scope) }
     var showSettings by remember { mutableStateOf(false) }
     var update by remember { mutableStateOf(false) }
 
@@ -194,6 +197,7 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>) {
                 Tab.Inbox -> InboxScreen(app, settingsVersion)
                 Tab.Search -> SearchScreen(app)
                 Tab.Remarkable -> RemarkableScreen(app, settingsVersion)
+                Tab.Chat -> ChatScreen(app, settingsVersion)
                 Tab.Activity -> ActivityScreen(app, settingsVersion)
             }
         }

@@ -158,3 +158,23 @@ val PAPER_TARGETS = listOf(
     "p2" to "P2 raiLParchitect",
     "p3" to "P3 raiLPoperator",
 )
+
+
+data class ChatThread(val id: String, val title: String, val updated: String, val model: String) {
+    companion object {
+        fun from(o: JSONObject) = ChatThread(o.optString("id"), o.optString("title"), o.optString("updated"), o.optString("model"))
+    }
+}
+
+/** role: user | assistant | tool_call | tool_result */
+data class ChatMsg(val role: String, val text: String, val name: String? = null) {
+    companion object {
+        fun from(o: JSONObject) = ChatMsg(o.optString("role"), o.optString("text"), o.str("name"))
+    }
+}
+
+data class ChatEvent(val type: String, val text: String, val name: String?) {
+    companion object {
+        fun from(o: JSONObject) = ChatEvent(o.optString("type"), o.optString("text"), o.str("name"))
+    }
+}
