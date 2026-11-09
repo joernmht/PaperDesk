@@ -160,17 +160,28 @@ class AgentApi(private val ctx: Context) {
 
     suspend fun threads() = withContext(Dispatchers.IO) { call("/api/agent/threads").optJSONArray("threads").mapObjects(ChatThread::from) }
 
-    suspend fun newThread(model: String?) = withContext(Dispatchers.IO) {
-        ChatThread.from(call("/api/agent/threads", "POST", JSONObject().apply { model?.let { put("model", it) } }))
+    suspend fun newThread(model: String?, repos: List<Pair<String, String>> = emptyList()) = withContext(Dispatchers.IO) {
+        val b = JSONObject().apply {
+            model?.let { put("model", it) }
+            if (repos.isNotEmpty()) put("repos", org.json.JSONArray(repos.map { (r, m) -> JSONObject().put("repo", r).put("mode", m) }))
+        }
+        ChatThread.from(call("/api/agent/threads", "POST", b))
+    }
+
+    suspend fun repos() = withContext(Dispatchers.IO) {
+        call("/api/agent/repos").optJSONArray("repos").mapObjects {
+            RepoInfo(it.optString("repo"), it.optString("description"), it.optBoolean("private"), it.optBoolean("writable"))
+        }
+    }
+
+    suspend fun attachRepo(id: String, repo: String, mode: String) = withContext(Dispatchers.IO) {
+        call("/api/agent/threads/$id/repos", "POST", JSONObject().put("repo", repo).put("mode", mode))
     }
 
     suspend fun deleteThread(id: String) = withContext(Dispatchers.IO) { call("/api/agent/threads/$id", "DELETE") }
 
-    /** (thread, raw history rows, pending approval events) */
-    suspend fun thread(id: String): Triple<ChatThread, List<JSONObject>, List<JSONObject>> = withContext(Dispatchers.IO) {
-        val r = call("/api/agent/threads/$id")
-        Triple(ChatThread.from(r), r.optJSONArray("messages").mapObjects { it }, r.optJSONArray("pending_approvals").mapObjects { it })
-    }
+    /** Raw thread: messages, turns [{user, steps, answer}], workspace, pending_approvals. */
+    suspend fun thread(id: String): JSONObject = withContext(Dispatchers.IO) { call("/api/agent/threads/$id") }
 
     suspend fun chat(id: String, text: String, onEvent: (JSONObject) -> Unit) =
         stream("/api/agent/threads/$id/chat", JSONObject().put("text", text), onEvent)

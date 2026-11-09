@@ -18,8 +18,8 @@ android {
         applicationId = "com.joernmht.paperdesk"
         minSdk = 33
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.7"
+        versionCode = 8
+        versionName = "0.8"
         // Baked in from android/local.properties (never committed); overridable in Settings.
         buildConfigField("String", "DEFAULT_URL", "\"${lp("paperdesk.url", "https://paper1.tailbf37ab.ts.net:8447")}\"")
         buildConfigField("String", "DEFAULT_TOKEN", "\"${lp("paperdesk.token", "")}\"")

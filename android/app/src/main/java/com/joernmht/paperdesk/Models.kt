@@ -176,6 +176,13 @@ sealed class ChatItem {
     data class Approval(val id: String, val text: String, val actions: List<ApprovalAction>, val state: String = "pending") : ChatItem()
 }
 
+data class RepoInfo(val repo: String, val description: String, val private: Boolean, val writable: Boolean)
+
+data class WorkspaceRepo(val repo: String, val mode: String, val branch: String?)
+
+fun parseWorkspace(o: JSONObject): List<WorkspaceRepo> =
+    o.optJSONArray("workspace").mapObjects { WorkspaceRepo(it.optString("repo"), it.optString("mode", "read"), it.str("branch")) }
+
 data class ApprovalAction(val name: String, val kind: String, val title: String, val args: List<Pair<String, String>>)
 
 data class TodoItem(val content: String, val status: String)
