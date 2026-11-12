@@ -1,6 +1,6 @@
 # PaperDesk API (contract between `server/` and `android/`)
 
-Base URL (tailnet only): `https://paper1.tailbf37ab.ts.net:8447` → box `127.0.0.1:8799`.
+Base URL (tailnet only): `https://<machine>.<tailnet>.ts.net:8447` → `127.0.0.1:8799` (`tailscale serve`).
 Every `/api/*` and `/files/*` request carries `Authorization: Bearer <token>` (token in
 `~/.config/paperdesk/token` on the box, baked into the APK at build time). JSON in and out, UTF-8.
 Errors: HTTP 4xx/5xx with `{"error": "..."}`.
@@ -24,12 +24,22 @@ Event = { seq: int, ts: str, kind: str, title: str, body: str, ref: str|null }
 ```
 
 ## Endpoints
-- `GET  /api/health` → `{ok: true, version: str, apk_version: int}`
+- `GET  /api/health` → `{ok, version, apk_version, name, profile: "portable"|"box",
+     features: {remarkable, drafts, transfer, topics, agent, rm_connect}: bool, targets: [{id, label}]}`
+  (servers before 0.2 send only the first three: the app then assumes every feature and targets P0–P3)
+- Pairing (no token): `GET /pair/<CODE>` = HTML page with the app download and a `paperdesk://pair?url=…&token=…&name=…[&agent=…]`
+  link (the QR code from `paperdesk pair` encodes this URL); `GET /api/pair?code=<CODE>` → `{url, token, name, agent}`
+  or 403. Codes: 8 characters `XXXX-XXXX`, case-insensitive, 30 minutes, 10 misses cancel all open codes.
+- Topics: `GET /api/topics` → `{topics: [{id, name, query, last_run}]}`; `POST /api/topics` body
+  `{op: "add", name, query}` | `{op: "remove", id}` | `{op: "run"}` → `{topics, job: Job|null}`. Their papers
+  arrive in the inbox with `source: "watch"`, `cat: "watch"`, `why: "Topic: <name>"`.
+- `POST /api/rm/connect` body `{code}` (8-letter one-time code from my.remarkable.com/device/browser/connect)
+  → `{job}`; when it is done `features.remarkable` turns true. Only when `features.rm_connect`.
 - `GET  /api/inbox?status=open|all` → `{items: [Paper]}`  (open = new + later + pending, newest run first)
 - `POST /api/action` body `{id, action, paper?, target?, toread?}` → `{item: Paper, job: Job|null}`
   - `action`: `"literature"` (add to corpus; `toread: true` also sends it to the reMarkable),
-    `"include"` (`target` = `p0|p1|p2|p3`: add to corpus if needed, then queue a cite note for that
-    paper's session), `"remarkable"` (send PDF to `/Papers/To read`), `"dismiss"`, `"later"`, `"restore"`.
+    `"include"` (`target` = one of health's `targets`: add to the library if needed, then copy the BibTeX
+    entry into that project's .bib (portable) or queue a cite note for that paper's session (box)), `"remarkable"` (send PDF to `/Papers/To read`), `"dismiss"`, `"later"`, `"restore"`.
   - `paper` = the full Paper object when the id is not in the inbox (search results).
 - `GET  /api/search?q=<text>&scope=library|web|all` → `{library: [Paper], web: [Paper]}`
 - `GET  /api/decisions` → `{decisions: [{ts, id, title, action, target, source, cat, run, why, doi, arxiv}], stats: {dismissed, literature, remarkable, later, include: {p0..p3}}}` (newest first; append-only log `~/.local/state/paperdesk/decisions.jsonl`, also read by the scout loops)

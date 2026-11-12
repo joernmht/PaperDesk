@@ -29,6 +29,7 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
 
     override suspend fun doWork(): Result {
         val ctx = applicationContext
+        if (!Prefs.configured(ctx)) return Result.success()
         val since = Prefs.lastSeq(ctx)
         val (events, last) = try {
             Api(ctx).events(maxOf(since, 0))
@@ -60,13 +61,20 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             )
         }
 
+        fun cancelAll(ctx: Context) {
+            WorkManager.getInstance(ctx).cancelUniqueWork(PERIODIC)
+            WorkManager.getInstance(ctx).cancelUniqueWork(BURST)
+        }
+
         fun schedulePeriodic(ctx: Context) {
+            if (!Prefs.configured(ctx)) return
             val req = PeriodicWorkRequestBuilder<PollWorker>(15, TimeUnit.MINUTES).setConstraints(net).build()
             WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, req)
         }
 
         /** After a job was started: poll at ~1, 3, 6 and 10 minutes so the result arrives quickly. */
         fun burst(ctx: Context) {
+            if (!Prefs.configured(ctx)) return
             val wm = WorkManager.getInstance(ctx)
             val delays = listOf(1L, 2L, 3L, 4L)   // cumulative 1, 3, 6, 10 min
             var chain = wm.beginUniqueWork(
@@ -84,7 +92,7 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         fun notify(ctx: Context, e: Event) {
             if (ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
             ensureChannel(ctx)
-            val tab = if (e.kind == "scout") "inbox" else "activity"
+            val tab = if (e.kind == "scout" || e.kind == "watch") "inbox" else "activity"
             val intent = Intent(ctx, MainActivity::class.java)
                 .putExtra(EXTRA_TAB, tab)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)

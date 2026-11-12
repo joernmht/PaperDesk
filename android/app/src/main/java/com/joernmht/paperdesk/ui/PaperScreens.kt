@@ -57,7 +57,11 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.joernmht.paperdesk.AppCtx
-import com.joernmht.paperdesk.PAPER_TARGETS
+import com.joernmht.paperdesk.Topic
+import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.RectangleShape
 import com.joernmht.paperdesk.Paper
 
 // ---------- shared card ----------
@@ -80,9 +84,13 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
         }
     }
 
-    Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).animateContentSize()) {
+    val info = app.info
+    BCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).animateContentSize()) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.Top) {
+                // the form says where this paper stands: ■ new, ▲ on its way, ● kept
+                Form(statusForm(if (p.inCorpus && p.status == "new") "added" else p.status), 14.dp,
+                    Modifier.padding(top = 5.dp, end = 8.dp), label = p.status)
                 Text(p.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f).clickable { expanded = !expanded })
                 val link = p.url ?: p.pdfUrl
@@ -92,42 +100,51 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
             }
             if (p.byline.isNotBlank()) Text(p.byline, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (p.status != "new") StatusBadge(p.status)
-                if (p.inCorpus) SuggestionChip(onClick = {}, label = { Text(p.bibkey ?: "in corpus") })
-                p.targets.forEach { SuggestionChip(onClick = {}, label = { Text(it.uppercase()) }) }
-                if (p.source.isNotBlank() && p.source != "scout") SuggestionChip(onClick = {}, label = { Text(p.source) })
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.padding(top = 4.dp)) {
+                StatusBadge(p.status)
+                if (p.inCorpus) BTag(p.bibkey ?: "in library", FormKind.Circle)
+                p.targets.forEach { BTag(it.uppercase(), FormKind.Circle) }
+                if (p.source.isNotBlank() && p.source != "scout") BTag(p.source)
             }
             p.why?.takeIf { it.isNotBlank() }?.let {
-                AssistChip(onClick = { expanded = !expanded }, label = {
-                    Text(it, maxLines = if (expanded) 6 else 1, overflow = TextOverflow.Ellipsis)
-                })
+                Row(Modifier.padding(top = 8.dp).fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant)
+                    .clickable { expanded = !expanded }.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text("Why", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(end = 8.dp))
+                    Text(it, style = MaterialTheme.typography.bodySmall, maxLines = if (expanded) 6 else 1, overflow = TextOverflow.Ellipsis)
+                }
             }
             p.abstract?.takeIf { it.isNotBlank() }?.let {
                 Text(it, style = MaterialTheme.typography.bodyMedium, maxLines = if (expanded) Int.MAX_VALUE else 3,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp).clickable { expanded = !expanded })
             }
-            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 6.dp))
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp),
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp),
                 verticalArrangement = Arrangement.Center) {
-                FilledTonalButton(onClick = { pickTarget = true }, contentPadding = PaddingValues(horizontal = 12.dp)) {
-                    Text("Include in…")
-                }
-                OutlinedButton(onClick = { act("remarkable") }, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                if (info.targets.isNotEmpty())
+                    BFilledButton(form = FormKind.Circle, onClick = { pickTarget = true }) { Text("Include in…") }
+                else
+                    BFilledButton(form = FormKind.Circle, enabled = !p.inCorpus, onClick = { act("literature") }) {
+                        Text(if (p.inCorpus) "In the library" else "Add to literature")
+                    }
+                if (info.remarkable) BOutlinedButton(form = FormKind.Triangle, onClick = { act("remarkable") }) {
                     Text("Send to reMarkable")
                 }
                 if (p.status == "dismissed")
-                    TextButton(onClick = { act("restore", label = "Restored") }) { Text("Restore") }
+                    BOutlinedButton(form = FormKind.Square, onClick = { act("restore", label = "Restored") }) { Text("Restore") }
                 else
-                    TextButton(onClick = { act("dismiss", label = "Dismissed") }) { Text("Dismiss") }
+                    BOutlinedButton(form = FormKind.Square, onClick = { act("dismiss", label = "Dismissed") }) { Text("Dismiss") }
                 Box {
                     IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Literature base + to read (reMarkable)") }, enabled = !p.inCorpus,
+                        if (info.remarkable) DropdownMenuItem(text = { Text("Literature base + to read (reMarkable)") }, enabled = !p.inCorpus,
+                            leadingIcon = { Form(FormKind.Circle) },
                             onClick = { menu = false; act("literature", toread = true) })
-                        DropdownMenuItem(text = { Text("Later") }, onClick = { menu = false; act("later", label = "Moved to later") })
+                        DropdownMenuItem(text = { Text("Later") }, leadingIcon = { Form(FormKind.Triangle) },
+                            onClick = { menu = false; act("later", label = "Moved to later") })
                         if (p.status == "later")
-                            DropdownMenuItem(text = { Text("Restore") }, onClick = { menu = false; act("restore", label = "Restored") })
+                            DropdownMenuItem(text = { Text("Restore") }, leadingIcon = { Form(FormKind.Square) },
+                                onClick = { menu = false; act("restore", label = "Restored") })
                     }
                 }
             }
@@ -139,12 +156,12 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
         title = { Text("Include in…") },
         text = {
             Column {
-                Text("Including it in a paper also adds it to the literature base, and queues a cite task for that paper's session.",
+                Text("Including it in a paper also adds it to the literature base, and queues a cite task for that paper.",
                     style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { pickTarget = false; act("literature") }, enabled = !p.inCorpus) {
                     Text(if (p.inCorpus) "Literature base (already in: ${p.bibkey ?: "yes"})" else "Literature base only")
                 }
-                PAPER_TARGETS.forEach { (pid, label) ->
+                info.targets.forEach { (pid, label) ->
                     val done = pid in p.targets
                     TextButton(onClick = { pickTarget = false; act("include", target = pid) }, enabled = !done) {
                         Text(if (done) "$label (already)" else label)
@@ -157,16 +174,9 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
     )
 }
 
+/** Status as form + word; never as a colour tint alone. */
 @Composable
-fun StatusBadge(status: String) {
-    val c = when (status) {
-        "pending" -> MaterialTheme.colorScheme.tertiaryContainer
-        "added", "included" -> MaterialTheme.colorScheme.primaryContainer
-        else -> MaterialTheme.colorScheme.surfaceVariant
-    }
-    SuggestionChip(onClick = {}, label = { Text(status) },
-        colors = androidx.compose.material3.SuggestionChipDefaults.suggestionChipColors(containerColor = c))
-}
+fun StatusBadge(status: String) = BTag(status, statusForm(status))
 
 private fun <T> MutableList<T>.replaceWhere(pred: (T) -> Boolean, v: T) {
     val i = indexOfFirst(pred); if (i >= 0) set(i, v)
@@ -193,19 +203,25 @@ fun InboxScreen(app: AppCtx, reloadKey: Int) {
         loading = false
     }
 
+    var topics by remember { mutableStateOf(false) }
+
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
             FilterChip(selected = !all, onClick = { all = false }, label = { Text("Open") })
             FilterChip(selected = all, onClick = { all = true }, label = { Text("All") })
             Spacer(Modifier.weight(1f))
-            Text("${items.size}", modifier = Modifier.align(Alignment.CenterVertically),
-                style = MaterialTheme.typography.labelMedium)
+            if (app.info.topics) TextButton(onClick = { topics = true }) { Text("Topics") }
+            Text("${items.size}", style = MaterialTheme.typography.labelLarge)
         }
         PullToRefreshBox(isRefreshing = loading, onRefresh = { tick++ }, modifier = Modifier.fillMaxSize()) {
             LazyColumn(Modifier.fillMaxSize()) {
-                error?.let { item { Text("Cannot reach the box: $it", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } }
+                error?.let { item { ErrorLine("Cannot reach the server: $it") } }
                 if (error == null && items.isEmpty() && !loading) item {
-                    Text("Inbox empty. New scout papers arrive weekly.", Modifier.padding(16.dp))
+                    if (app.info.topics) Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Nothing here yet — add topics to follow")
+                        BFilledButton(form = FormKind.Triangle, onClick = { topics = true }) { Text("Topics") }
+                    } else Text("Inbox empty. New scout papers arrive weekly.", Modifier.padding(16.dp))
                 }
                 items(items, key = { it.id }) { p ->
                     PaperCard(app, p) { upd ->
@@ -217,6 +233,71 @@ fun InboxScreen(app: AppCtx, reloadKey: Int) {
             }
         }
     }
+    if (topics) TopicsDialog(app) { topics = false; tick++ }
+}
+
+/** Topics the server watches: list, add (name + search words), remove, run now. Returns via [onCount] how many exist. */
+@Composable
+fun TopicsEditor(app: AppCtx, showRun: Boolean = true, onCount: (Int) -> Unit = {}) {
+    val list = remember { mutableStateListOf<Topic>() }
+    var error by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var name by remember { mutableStateOf("") }
+    var query by remember { mutableStateOf("") }
+
+    fun set(t: List<Topic>) { list.clear(); list.addAll(t); error = null; loading = false; onCount(t.size) }
+    LaunchedEffect(Unit) {
+        try { set(app.api.topics()) } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName; loading = false }
+    }
+
+    Column {
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
+        error?.let { ErrorLine(it, Modifier.padding(top = 8.dp)) }
+        if (!loading && error == null && list.isEmpty()) Text("No topics yet.", Modifier.padding(top = 8.dp))
+        list.forEach { t ->
+            Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Form(FormKind.Circle, 12.dp, Modifier.padding(end = 8.dp), label = "following")
+                Column(Modifier.weight(1f)) {
+                    Text(t.name, style = MaterialTheme.typography.titleSmall)
+                    Text(t.query, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(t.lastRun?.let { "last run " + it.replace('T', ' ').take(16) } ?: "not run yet",
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                TextButton(onClick = { app.run(null, { app.api.topicsOp("remove", id = t.id) }) { (ts, _) -> set(ts) } }) {
+                    Form(FormKind.Square, 10.dp, Modifier.padding(end = 6.dp)); Text("Remove")
+                }
+            }
+        }
+        InkRule(Modifier.padding(top = 12.dp))
+        OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth().padding(top = 8.dp), label = { Text("Name") },
+            placeholder = { Text("Railway rescheduling") }, singleLine = true)
+        OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), label = { Text("Search words") },
+            placeholder = { Text("railway rescheduling optimisation") }, singleLine = true)
+        Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            BOutlinedButton(form = FormKind.Circle, enabled = query.isNotBlank(), onClick = {
+                val n = name.trim().ifBlank { query.trim() }
+                app.run(null, { app.api.topicsOp("add", name = n, query = query.trim()) }) { (ts, _) -> set(ts); name = ""; query = "" }
+            }) { Text("Add topic") }
+            if (showRun) BOutlinedButton(form = FormKind.Triangle, enabled = list.isNotEmpty(), onClick = {
+                app.run(null, { app.api.topicsOp("run") }) { (ts, job) -> set(ts); app.jobStarted(job) }
+            }) { Text("Run now") }
+        }
+    }
+}
+
+@Composable
+fun TopicsDialog(app: AppCtx, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Topics") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("The server searches each topic regularly and puts new papers into your inbox.", style = MaterialTheme.typography.bodySmall)
+                TopicsEditor(app)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+    )
 }
 
 // ---------- Search ----------
@@ -251,7 +332,7 @@ fun SearchScreen(app: AppCtx) {
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(12.dp)) {
             scopes.forEachIndexed { i, (k, label) ->
                 SegmentedButton(selected = scope == k, onClick = { scope = k; if (searched) go() },
-                    shape = SegmentedButtonDefaults.itemShape(i, scopes.size)) { Text(label) }
+                    shape = RectangleShape) { Text(label) }
             }
         }
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -274,6 +355,6 @@ fun SearchScreen(app: AppCtx) {
 
 @Composable
 fun Header(text: String) {
-    Text(text, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp))
+    Text(text, style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 8.dp))
 }

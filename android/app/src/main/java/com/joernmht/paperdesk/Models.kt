@@ -114,8 +114,9 @@ data class Decision(val ts: String, val title: String, val action: String, val t
 fun decisionStats(o: JSONObject?): String {
     if (o == null) return ""
     val inc = o.optJSONObject("include")
-    val perPaper = PAPER_TARGETS.mapNotNull { (pid, _) -> inc?.optInt(pid, 0)?.takeIf { it > 0 }?.let { "${pid.uppercase()} $it" } }
-    val incTotal = PAPER_TARGETS.sumOf { (pid, _) -> inc?.optInt(pid, 0) ?: 0 }
+    val keys = inc?.keys()?.asSequence()?.toList()?.sorted().orEmpty()
+    val perPaper = keys.mapNotNull { pid -> inc?.optInt(pid, 0)?.takeIf { it > 0 }?.let { "${pid.uppercase()} $it" } }
+    val incTotal = keys.sumOf { pid -> inc?.optInt(pid, 0) ?: 0 }
     return "Included $incTotal" + (if (perPaper.isNotEmpty()) " (" + perPaper.joinToString(", ") + ")" else "") +
         " · literature ${o.optInt("literature")} · dismissed ${o.optInt("dismissed")} · reMarkable ${o.optInt("remarkable")}"
 }
@@ -152,12 +153,50 @@ fun parseRmLs(o: JSONObject): List<RmEntry> = o.optJSONArray("entries").mapObjec
     RmEntry(it.optString("name"), it.optString("type"), it.optString("path"))
 }
 
-val PAPER_TARGETS = listOf(
+/** Targets of servers older than 0.2, which do not list them in /api/health. */
+val LEGACY_TARGETS = listOf(
     "p0" to "P0 raiLPminer",
     "p1" to "P1 LP Mining",
     "p2" to "P2 raiLParchitect",
     "p3" to "P3 raiLPoperator",
 )
+
+/**
+ * What this server offers (GET /api/health). A server that sends no `features` is a pre-0.2 one: everything it
+ * always had is on, with the classic targets; topics (new in 0.2) are off.
+ */
+data class ServerInfo(
+    val name: String, val remarkable: Boolean, val drafts: Boolean, val transfer: Boolean, val topics: Boolean,
+    val agent: Boolean, val targets: List<Pair<String, String>>,
+    /** The server can register itself with a reMarkable from a one-time code (setup wizard step). */
+    val rmConnect: Boolean = false,
+) {
+    companion object {
+        val LEGACY = ServerInfo("", remarkable = true, drafts = true, transfer = true, topics = false, agent = true, targets = LEGACY_TARGETS)
+
+        fun from(o: JSONObject): ServerInfo {
+            val f = o.optJSONObject("features") ?: return LEGACY.copy(name = o.optString("name"))
+            val rm = f.optBoolean("remarkable", true)
+            return ServerInfo(
+                rmConnect = f.optBoolean("rm_connect", false),
+                name = o.optString("name"), remarkable = rm,
+                drafts = rm && f.optBoolean("drafts", true), transfer = rm && f.optBoolean("transfer", true),
+                topics = f.optBoolean("topics", false), agent = f.optBoolean("agent", true),
+                targets = if (o.has("targets")) o.optJSONArray("targets").mapObjects {
+                    it.optString("id") to it.optString("label", it.optString("id").uppercase())
+                }.filter { it.first.isNotBlank() } else LEGACY_TARGETS,
+            )
+        }
+    }
+}
+
+/** A topic the server watches for new papers (results arrive in the inbox with source "watch"). */
+data class Topic(val id: String, val name: String, val query: String, val lastRun: String?) {
+    companion object {
+        fun from(o: JSONObject) = Topic(o.optString("id"), o.optString("name"), o.optString("query"),
+            if (o.isNull("last_run")) null else o.optString("last_run").takeIf { it.isNotBlank() })
+    }
+}
 
 
 data class ChatThread(val id: String, val title: String, val updated: String, val model: String, val approvals: String = "auto",

@@ -16,7 +16,7 @@ import java.net.URL
 class PaperDeskApp : Application() {
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
-        // breadcrumb: the box's server log shows "GET /api/health?stage=attach" if the process starts at all
+        // breadcrumb: the server log shows "GET /api/health?stage=attach" if the process starts at all
         Thread { ping(base) }.start()
         // a crash from a previous launch is sent NOW, before any provider can crash this launch too
         val old = crashFile(base)
@@ -46,6 +46,7 @@ class PaperDeskApp : Application() {
                 e.stackTraceToString()
 
         fun ping(ctx: Context) = try {
+            if (!Prefs.configured(ctx)) throw IllegalStateException("not paired")
             val c = URL(Prefs.url(ctx) + "/api/health?stage=attach&v=${BuildConfig.VERSION_CODE}").openConnection() as HttpURLConnection
             c.connectTimeout = 5000; c.readTimeout = 5000
             c.setRequestProperty("Authorization", "Bearer " + Prefs.token(ctx))
@@ -54,6 +55,7 @@ class PaperDeskApp : Application() {
         }
 
         fun send(ctx: Context, trace: String): Boolean = try {
+            if (!Prefs.configured(ctx)) throw IllegalStateException("not paired")   // keep the file; sent once paired
             val c = URL(Prefs.url(ctx) + "/api/crash").openConnection() as HttpURLConnection
             c.requestMethod = "POST"; c.connectTimeout = 4000; c.readTimeout = 4000; c.doOutput = true
             c.setRequestProperty("Authorization", "Bearer " + Prefs.token(ctx))

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PaperDesk mark: three forms, three colours. Blue circle (lamp / what you know), red square sheet,
+     yellow triangle (the folded corner), on an ink bar (the desk). Source: docs/icon.svg -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#1E4FA3" android:pathData="M40,45m-16,0a16,16 0,1 1,32 0a16,16 0,1 1,-32 0" />
+    <path android:fillColor="#D8232A" android:pathData="M45,31H62L75,44V71H45Z" />
+    <path android:fillColor="#F2C200" android:pathData="M62,31L75,44H62Z" />
+    <path android:fillColor="#141414" android:pathData="M30,71H78V76H30Z" />
+</vector>

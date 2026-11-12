@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Simple adaptive-style icon: a page with a corner fold on teal. -->
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item><shape android:shape="oval"><solid android:color="#00897B" /></shape></item>
-    <item android:drawable="@drawable/ic_page" android:gravity="center" android:width="56dp" android:height="56dp" />
-</layer-list>

@@ -8,7 +8,10 @@ plugins {
 val localProps = Properties().apply {
     rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
-fun lp(key: String, def: String) = (localProps.getProperty(key) ?: def).replace("\"", "")
+// -Ppaperdesk.public=true: the build anyone may have. Nothing from local.properties is baked in; the app
+// starts on its setup screen and is connected with a pairing link (paperdesk://pair?…).
+val publicBuild = (findProperty("paperdesk.public") as String?).toBoolean()
+fun lp(key: String) = if (publicBuild) "" else (localProps.getProperty(key) ?: "").replace("\"", "").replace("\\", "")
 
 android {
     namespace = "com.joernmht.paperdesk"
@@ -18,14 +21,16 @@ android {
         applicationId = "com.joernmht.paperdesk"
         minSdk = 33
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.10"
-        // Baked in from android/local.properties (never committed); overridable in Settings.
-        buildConfigField("String", "DEFAULT_URL", "\"${lp("paperdesk.url", "https://paper1.tailbf37ab.ts.net:8447")}\"")
-        buildConfigField("String", "DEFAULT_TOKEN", "\"${lp("paperdesk.token", "")}\"")
+        versionCode = 11
+        versionName = "0.11"
+        // Private build only: baked in from android/local.properties (never committed); overridable in Settings.
+        buildConfigField("String", "DEFAULT_URL", "\"${lp("paperdesk.url")}\"")
+        buildConfigField("String", "DEFAULT_TOKEN", "\"${lp("paperdesk.token")}\"")
+        buildConfigField("String", "DEFAULT_AGENT_URL", "\"${lp("paperdesk.agent")}\"")
+        buildConfigField("boolean", "PUBLIC_BUILD", "$publicBuild")
     }
     buildTypes {
-        // R8-shrunk build (56 MB debug → a few MB; icons-extended is huge). Debug-signed: never published.
+        // R8-shrunk build (56 MB debug → a few MB; icons-extended is huge). Debug-signed.
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -51,4 +56,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
     // Markdown in chat answers; 0.35.0 = last release built with Kotlin 2.1 (the project uses Kotlin 2.2.10)
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.35.0")
+    // QR scanner for the setup wizard: Google's ready-made scanner screen, needs no camera permission
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    // play-services drags in Fragment 1.0, which breaks registerForActivityResult (lint: InvalidFragmentVersionForActivityResult)
+    implementation("androidx.fragment:fragment:1.8.5")
 }

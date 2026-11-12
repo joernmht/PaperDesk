@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -71,11 +71,8 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -176,7 +173,7 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
                         Text(hosting, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                error?.let { item { Text("Cannot reach the agent: $it", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error) } }
+                error?.let { item { ErrorLine("Cannot reach the agent: $it") } }
                 if (error == null && threads.isEmpty() && !loading) item { Text("No chats yet. Start one below.", Modifier.padding(16.dp)) }
                 items(threads, key = { it.id }) { t ->
                     ListItem(
@@ -196,6 +193,8 @@ private fun ThreadList(app: AppCtx, reloadKey: Int, onOpen: (String) -> Unit) {
             }
         }
         ExtendedFloatingActionButton(onClick = { setup = true }, icon = { Icon(Icons.Filled.Add, null) }, text = { Text("New chat") },
+            shape = RectangleShape, containerColor = MaterialTheme.colorScheme.onSurface, contentColor = MaterialTheme.colorScheme.surface,
+            elevation = FloatingActionButtonDefaults.elevation(0.dp, 0.dp, 0.dp, 0.dp),
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp))
     }
 
@@ -231,7 +230,7 @@ private fun RepoPicker(app: AppCtx, chosen: MutableMap<String, String>, exclude:
     }
     Column {
         OutlinedTextField(filter, { filter = it }, Modifier.fillMaxWidth(), placeholder = { Text("Filter repos") }, singleLine = true)
-        error?.let { Text("Cannot load repos: $it", color = MaterialTheme.colorScheme.error) }
+        error?.let { ErrorLine("Cannot load repos: $it", Modifier) }
         val shown = repos.filter { it.repo !in exclude && (filter.isBlank() || it.repo.contains(filter, true) || it.description.contains(filter, true)) }
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
             items(shown, key = { it.repo }) { r ->
@@ -279,7 +278,7 @@ private fun NewChatDialog(app: AppCtx, models: List<String>, defaultModel: Strin
         text = {
             Column {
                 Box {
-                    OutlinedButton(onClick = { modelMenu = true }) { Text("Model: " + model.ifBlank { "default" }.substringAfter('/')) }
+                    BOutlinedButton(onClick = { modelMenu = true }) { Text("Model: " + model.ifBlank { "default" }.substringAfter('/')) }
                     DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
                         models.forEach { m -> DropdownMenuItem(text = { Text(m.substringAfter('/')) }, onClick = { model = m; modelMenu = false }) }
                     }
@@ -560,7 +559,7 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             workspace.forEach { w ->
                 AssistChip(onClick = { repoMenu = true },
-                    label = { Text(w.name + (if (w.mode == "write") " · write" else " · read") + (if (w.source.startsWith("box")) " · box" else "")) },
+                    label = { Text(w.name + (if (w.mode == "write") " · write" else " · read") + (if (w.source.startsWith("box")) " · server" else "")) },
                     leadingIcon = { Icon(if (w.mode == "write") Icons.Filled.Edit else Icons.Filled.Lock, null, Modifier.size(16.dp)) })
             }
         }
@@ -570,7 +569,7 @@ private fun ThreadView(app: AppCtx, id: String, onBack: () -> Unit) {
             items(turns.size) { i ->
                 TurnView(app, turns[i], enabled = !busy, activity = if (i == turns.size - 1) activity else null) { ok, reason -> decide(ok, reason) }
             }
-            error?.let { item { Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error) } }
+            error?.let { item { ErrorLine(it, Modifier.padding(12.dp)) } }
         }
         Row(Modifier.padding(8.dp), verticalAlignment = Alignment.Bottom) {
             OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("Ask…") }, maxLines = 6)
@@ -592,13 +591,13 @@ private fun tok(n: Int): String = when {
 
 @Composable
 private fun Tag(text: String) {
-    Text(text, Modifier.padding(end = 6.dp).background(MaterialTheme.colorScheme.tertiaryContainer, RoundedCornerShape(4.dp))
+    Text(text, Modifier.padding(end = 6.dp).background(MaterialTheme.colorScheme.tertiaryContainer, RectangleShape)
         .padding(horizontal = 4.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
 }
 
 @Composable
 private fun OnBoxBadge() {
-    Text("on box", Modifier.padding(start = 6.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(4.dp))
+    Text("on server", Modifier.padding(start = 6.dp).background(MaterialTheme.colorScheme.secondaryContainer, RectangleShape)
         .padding(horizontal = 4.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
 }
 
@@ -694,7 +693,7 @@ private fun StepsDropdown(app: AppCtx, steps: List<ChatItem>, running: Boolean, 
         else -> "${boxes.size} step${if (boxes.size == 1) "" else "s"}" + (if (failed > 0) " · $failed failed" else "")
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(10.dp))) {
+        .border(BorderW, MaterialTheme.colorScheme.onSurface, RectangleShape)) {
         Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically) {
             if (running) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -725,7 +724,7 @@ private fun Bubble(m: ChatItem.Msg) {
     val bg = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
     val fg = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
     Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-        Box(Modifier.widthIn(max = if (mine) 300.dp else 360.dp).background(bg, RoundedCornerShape(14.dp))
+        Box(Modifier.widthIn(max = if (mine) 300.dp else 360.dp).background(bg, RectangleShape)
             .padding(horizontal = 10.dp, vertical = 6.dp)) {
             CompositionLocalProvider(LocalContentColor provides fg) {
                 if (mine) SelectionContainer { Text(m.text, style = MaterialTheme.typography.bodyMedium, color = fg) }
@@ -749,10 +748,10 @@ private fun kindIcon(kind: String): ImageVector = when (kind) {
 private fun StepBox(app: AppCtx, s: ChatItem.Step) {
     var expanded by remember { mutableStateOf(false) }
     val failed = s.ok == false
-    val border = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outlineVariant
+    val border = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-        .border(1.dp, border, RoundedCornerShape(10.dp))
-        .background(if (failed) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp))
+        .border(BorderW, border, RectangleShape)
+        .background(if (failed) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface, RectangleShape)
         .clickable { expanded = !expanded }
         .padding(horizontal = 10.dp, vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -767,8 +766,8 @@ private fun StepBox(app: AppCtx, s: ChatItem.Step) {
             }
             when {
                 s.result == null -> CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                failed -> Icon(Icons.Filled.Error, "failed", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
-                else -> Icon(Icons.Filled.CheckCircle, "ok", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                failed -> Form(FormKind.Square, 14.dp, label = "failed")
+                else -> Form(FormKind.Circle, 14.dp, label = "ok")
             }
         }
         s.url?.let { u -> TextButton(onClick = { app.openUrl(u) }, contentPadding = PaddingValues(0.dp)) { Text("Open ${if ("/pull/" in u) "pull request" else "link"}") } }
@@ -784,7 +783,7 @@ private fun Mono(label: String, text: String) {
     Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
     SelectionContainer {
         Text(text.take(6000), fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 14.sp,
-            modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(6.dp)).padding(6.dp))
+            modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RectangleShape).padding(6.dp))
     }
 }
 
@@ -793,7 +792,7 @@ private fun PlanPanel(todos: List<TodoItem>) {
     var expanded by remember { mutableStateOf(true) }
     val done = todos.count { it.status == "completed" }
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
-        .background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(10.dp))
+        .background(MaterialTheme.colorScheme.surfaceVariant, RectangleShape)
         .clickable { expanded = !expanded }.padding(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Filled.Checklist, null, Modifier.size(18.dp))
@@ -821,10 +820,11 @@ private fun PlanPanel(todos: List<TodoItem>) {
 private fun ApprovalCard(a: ChatItem.Approval, enabled: Boolean, onDecide: (Boolean, String?) -> Unit) {
     var reason by remember { mutableStateOf("") }
     var rejecting by remember { mutableStateOf(false) }
-    Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+    BCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp), container = MaterialTheme.colorScheme.tertiaryContainer) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                Form(FormKind.Triangle, 14.dp, label = "waiting")
+                Spacer(Modifier.width(6.dp))
                 Icon(Icons.Filled.Gavel, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("Approval needed", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -843,8 +843,8 @@ private fun ApprovalCard(a: ChatItem.Approval, enabled: Boolean, onDecide: (Bool
                 if (rejecting) OutlinedTextField(reason, { reason = it }, Modifier.fillMaxWidth().padding(top = 8.dp),
                     placeholder = { Text("Why? (optional, the agent sees this)") }, maxLines = 4)
                 Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { onDecide(true, null) }, enabled = enabled && !rejecting) { Text("Approve") }
-                    OutlinedButton(onClick = { if (rejecting) onDecide(false, reason) else rejecting = true }, enabled = enabled) {
+                    BFilledButton(form = FormKind.Circle, onClick = { onDecide(true, null) }, enabled = enabled && !rejecting) { Text("Approve") }
+                    BOutlinedButton(form = FormKind.Square, onClick = { if (rejecting) onDecide(false, reason) else rejecting = true }, enabled = enabled) {
                         Text(if (rejecting) "Send rejection" else "Reject")
                     }
                     if (rejecting) TextButton(onClick = { rejecting = false; reason = "" }) { Text("Cancel") }

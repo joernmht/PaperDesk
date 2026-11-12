@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon: the PaperDesk mark (circle, sheet with folded corner, desk bar) in one colour. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
-    <path android:fillColor="#FFFFFF"
-        android:pathData="M6,2h8l6,6v12c0,1.1 -0.9,2 -2,2H6c-1.1,0 -2,-0.9 -2,-2V4c0,-1.1 0.9,-2 2,-2zM13,3.5V9h5.5L13,3.5z" />
+    <group android:scaleX="0.4" android:scaleY="0.4" android:translateX="-9.6" android:translateY="-9.4">
+        <path android:fillColor="#FFFFFF" android:pathData="M43,29.3A16,16 0,1 0,43 60.7Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M45,31H60V46H75V69H45Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M62.5,32.5L73.5,43.5H62.5Z" />
+        <path android:fillColor="#FFFFFF" android:pathData="M30,71H78V76H30Z" />
+    </group>
 </vector>

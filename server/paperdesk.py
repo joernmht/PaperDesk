@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""PaperDesk server — the box side of Joern's PaperDesk Android app (contract: ../API.md).
+"""PaperDesk server — the machine side of the PaperDesk Android app (contract: ../API.md).
 
-    paperdesk.py serve [--port 8799]          HTTP API on 127.0.0.1 (tailnet :8447 via tailscale serve)
-    paperdesk.py event --kind K --title T [--body B] [--ref R]   append an event (notify.sh mirrors here)
+    paperdesk.py serve [--port 8799]          HTTP API on 127.0.0.1 (published by `tailscale serve`)
+    paperdesk.py pair                         print a pairing link + QR code for the phone (valid 30 min)
+    paperdesk.py status                       what this desk is configured to do
+    paperdesk.py event --kind K --title T [--body B] [--ref R]   append an event (shows as a notification)
 
-Inbox = the scout loop's paper picks (~/.claude/scout/papers.jsonl + candidates/*.json). Actions run as
+Two profiles (~/.config/paperdesk/config.toml, `profile = ...`):
+- "portable" (default, what install.sh sets up): everything comes from this repo (pdlib.py). The inbox is
+  filled by the topic watch (arXiv + OpenAlex), the library is one folder with library.bib + pdfs/,
+  "Add to literature" is deterministic (BibTeX from doi.org, open-access PDF), the reMarkable is optional.
+- "box": Joern's research box, described in the rest of this docstring.
+
+Box profile: Inbox = the scout loop's paper picks (~/.claude/scout/papers.jsonl + candidates/*.json). Actions run as
 queued jobs, one at a time (RAM): corpus intake = headless `claude -p` with the literature-intake skill,
 "include in paper" = a cite note queued in that paper session's cockpit INBOX-literature.md,
 reMarkable = rmapi + ~/.claude/loops/remarkable_papers.py, handwritten marks → LaTeX = headless
@@ -35,13 +43,17 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1"
+import pdlib
+
+VERSION = "0.2"
 HOME = Path.home()
-STATE_DIR = HOME / ".local/state/paperdesk"
+CFG = pdlib.load_config()
+BOX = CFG["profile"] == "box"
+STATE_DIR = pdlib.STATE_DIR
 STATE = STATE_DIR / "state.json"
 EVENTS = STATE_DIR / "events.jsonl"
 JOBS = STATE_DIR / "jobs"
-TOKEN_FILE = HOME / ".config/paperdesk/token"
+TOKEN_FILE = pdlib.CONFIG_DIR / "token"
 DIST = Path(__file__).resolve().parent.parent / "dist"
 SCOUT = HOME / ".claude/scout"
 SKILLS = HOME / ".claude/skills"
@@ -51,10 +63,14 @@ RMPAPERS = LOOPS / "remarkable_papers.py"
 ANNOT = HOME / "remarkable/annotated"
 LIT = HOME / "LiteratureAssistant"
 CLAUDE = str(HOME / ".nvm/versions/node/v24.14.1/bin/claude")
-TOREAD_DIR = "/Papers/To read"
-# paper -> (label, cockpit of the session that owns its manuscript)
-PAPERS = {"p0": ("P0 raiLPminer", "paper1"), "p1": ("P1 LP Mining with LP2Graph", "paper1"),
-          "p2": ("P2 raiLParchitect", "paper2"), "p3": ("P3 raiLPoperator", "paper3")}
+TOREAD_DIR = CFG["remarkable"].get("folder") or "/Papers/To read"
+if BOX:
+    # paper -> (label, cockpit of the session that owns its manuscript)
+    PAPERS = {"p0": ("P0 raiLPminer", "paper1"), "p1": ("P1 LP Mining with LP2Graph", "paper1"),
+              "p2": ("P2 raiLParchitect", "paper2"), "p3": ("P3 raiLPoperator", "paper3")}
+else:
+    # target -> (label, .bib file that "Include in ..." copies the entry into)
+    PAPERS = {str(t["id"]): (str(t.get("label") or t["id"]), str(t.get("bib") or "")) for t in CFG["targets"]}
 
 LOCK = threading.RLock()
 
@@ -70,10 +86,30 @@ def _load_module(name: str, path: Path):
     return mod
 
 
-lit = _load_module("pd_lit", SKILLS / "literature/scripts/lit.py")
-pc = _load_module("pd_pc", SKILLS / "scout/scripts/paper_candidates.py")
-rmp = _load_module("pd_rmp", RMPAPERS)
+if BOX:
+    lit = _load_module("pd_lit", SKILLS / "literature/scripts/lit.py")
+    pc = _load_module("pd_pc", SKILLS / "scout/scripts/paper_candidates.py")
+    rmp = _load_module("pd_rmp", RMPAPERS)
+    LIBRARY = None
+else:                                   # same call surface, served from this repo
+    LIBRARY = lit = pdlib.Library(Path(CFG["library"]["dir"]))
+    pc = pdlib
+    rmp = pdlib.Remarkable(CFG["remarkable"], LIBRARY)
+    RMAPI = rmp.bin
 pc.load_secrets()
+
+
+def rm_available() -> bool:
+    if BOX:
+        return str(CFG["remarkable"].get("enabled", "auto")).lower() not in ("false", "no", "off", "0")
+    return rmp.available()
+
+
+def features() -> dict:
+    rm = rm_available()
+    return {"remarkable": rm, "drafts": BOX and rm, "transfer": BOX and rm,
+            "topics": bool(CFG["watch"].get("enabled", True)), "agent": bool(CFG.get("agent_url")),
+            "rm_connect": not BOX and str(CFG["remarkable"].get("enabled", "auto")).lower() not in ("false", "no", "off", "0")}
 
 
 # ------------------------------------------------------------------ state + events
@@ -121,6 +157,7 @@ def log_decision(item: dict, action: str, target: str | None = None) -> None:
     rec = {"ts": now(), "id": item["id"], "title": item["title"], "action": action, "target": target,
            "source": item.get("source"), "cat": item.get("cat"), "run": item.get("run"), "why": item.get("why"),
            "doi": item.get("doi"), "arxiv": item.get("arxiv")}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK, DECISIONS.open("a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -190,6 +227,8 @@ def enrich(p: dict, st: dict, cidx=None) -> dict:
 def scout_items() -> list[dict]:
     """Scout picks joined with the candidate metadata of their run."""
     picks = []
+    if not BOX:
+        return []
     led = SCOUT / "papers.jsonl"
     if led.exists():
         picks = [json.loads(l) for l in led.read_text().splitlines() if l.strip()]
@@ -234,15 +273,17 @@ def find_paper(pid: str) -> dict | None:
     return st["extra"].get(pid)
 
 
+EXTRA_KEYS = ("id", "title", "authors", "year", "venue", "abstract", "url", "pdf_url", "doi", "arxiv", "why",
+              "cat", "run", "source")
+
+
 def set_item(pid: str, paper: dict | None = None, **kw) -> None:
     with LOCK:
         st = load_state()
         rec = st["items"].setdefault(pid, {})
         rec.update({k: v for k, v in kw.items() if v is not None})
         if paper and not any(p["id"] == pid for p in scout_items()):
-            st["extra"][pid] = {k: paper.get(k) for k in
-                                ("id", "title", "authors", "year", "venue", "abstract", "url", "pdf_url",
-                                 "doi", "arxiv", "why", "cat", "run", "source")}
+            st["extra"][pid] = {k: paper.get(k) for k in EXTRA_KEYS}
         save_state(st)
 
 
@@ -446,7 +487,9 @@ def job_load(jid: str, tail: int = 1500) -> dict:
 def job_save(j: dict) -> None:
     with LOCK:
         JOBS.mkdir(parents=True, exist_ok=True)
-        job_path(j["id"]).write_text(json.dumps(j, indent=1, ensure_ascii=False))
+        tmp = JOBS / f".{j['id']}.tmp"          # atomic: a reader never sees a half-written record
+        tmp.write_text(json.dumps(j, indent=1, ensure_ascii=False))
+        tmp.replace(job_path(j["id"]))
 
 
 def new_job(kind: str, title: str, spec: dict) -> dict:
@@ -569,6 +612,15 @@ def k_literature(spec: dict, log: Path) -> str:
     if paper.get("bibkey"):
         key = paper["bibkey"]
         res = f"already in the corpus as {key}"
+    elif not BOX:
+        key, has_pdf = LIBRARY.add(paper, toread=bool(spec.get("toread")))
+        res = f"added as {key} ({'with' if has_pdf else 'no open'} PDF)"
+        if spec.get("toread") and rm_available():
+            if has_pdf:
+                _send_to_remarkable(dict(paper, bibkey=key), log)
+                res += ", sent to reMarkable"
+            else:
+                res += ", not sent to reMarkable (no PDF)"
     else:
         toread = ("Joern wants to READ it: add `toread` to its keywords (the box then sends it to his reMarkable)."
                   if spec.get("toread") else "Do NOT add the `toread` keyword.")
@@ -581,9 +633,16 @@ def k_literature(spec: dict, log: Path) -> str:
         _send_to_remarkable(paper, log)
         res += ", sent to reMarkable"
     status = "added"
-    if spec.get("target"):
+    if spec.get("target") and BOX:
         f = _queue_cite(spec["target"], key, paper)
         res += f"; cite queued for {spec['target'].upper()} ({f.parent.name} session)"
+        status = "included"
+    elif spec.get("target"):
+        label, bib = PAPERS[spec["target"]]
+        if not bib:
+            raise RuntimeError(f"target {spec['target']} has no bib file in config.toml")
+        wrote = pdlib.copy_to_bib(LIBRARY.raw(key) or "", key, Path(bib))
+        res += f"; {'copied into' if wrote else 'already in'} {label} ({Path(bib).name})"
         status = "included"
     with LOCK:
         st = load_state()
@@ -603,8 +662,9 @@ def _send_to_remarkable(paper: dict, log: Path) -> str:
         pdf = Path(td) / f"{name}.pdf"
         if not _fetch_pdf(paper, pdf):
             raise RuntimeError("no open PDF found (paywalled?) — add it to the corpus with a PDF first")
-        rmp.rmapi("mkdir", "/Papers")
-        rmp.rmapi("mkdir", TOREAD_DIR)
+        parts = [x for x in TOREAD_DIR.split("/") if x]
+        for i in range(len(parts)):                 # idempotent: errors if the folder exists
+            rmp.rmapi("mkdir", "/" + "/".join(parts[:i + 1]))
         rc, out = _run([RMAPI, "put", str(pdf), TOREAD_DIR], log, timeout=300)
         if rc != 0 and "already exists" not in out:
             raise RuntimeError(f"rmapi put failed: {out.strip()[-200:]}")
@@ -685,7 +745,91 @@ def _rm_state_move(old: str, new: str) -> None:
     rmp.save_state(st)
 
 
-JOB_KINDS = {"literature": k_literature, "remarkable": k_remarkable, "rm_draft": k_rm_draft,
+def k_watch(spec: dict, log: Path) -> str:
+    """Topic watch: recent papers for each topic land in the inbox (no LLM; 'why' names the topic)."""
+    w = CFG["watch"]
+    per, days = int(w.get("per_topic", 6)), int(w.get("days", 45))
+    topics = [t for t in pdlib.topics_load() if not spec.get("topic") or t["id"] == spec["topic"]]
+    st, (ids, titles) = load_state(), corpus_index()
+    known = set(st["items"]) | set(st["extra"]) | set(ids) | {p["id"] for p in scout_items()}
+    known_t = set(titles) | {norm_title(p.get("title") or "") for p in st["extra"].values()}
+    fresh, ran = [], {}
+    for t in topics:
+        found = pdlib.watch_search(t["query"], days, per)
+        with log.open("a") as f:
+            f.write(f"{t['name']}: {len(found)} candidates\n")
+        n = 0
+        for p in found:
+            pid, nt = paper_id(p), norm_title(p.get("title") or "")
+            if not nt or pid in known or nt in known_t:
+                continue
+            known.add(pid)
+            known_t.add(nt)
+            p.update(id=pid, why=f"Topic: {t['name']}", cat="watch", run=str(dt.date.today()), source="watch",
+                     year=(p.get("date") or "")[:4] or None)
+            fresh.append(p)
+            n += 1
+            if n >= per:
+                break
+        ran[t["id"]] = now()
+    with LOCK:
+        st = load_state()
+        for p in fresh:
+            st["extra"][p["id"]] = {k: p.get(k) for k in EXTRA_KEYS}
+        save_state(st)
+        cur = pdlib.topics_load()
+        for t in cur:
+            if t["id"] in ran:
+                t["last_run"] = ran[t["id"]]
+        pdlib.topics_save(cur)
+    if fresh:
+        add_event("scout", f"📚 {len(fresh)} new paper(s) in your inbox",
+                  "\n".join("• " + p["title"][:90] for p in fresh[:5]))
+    return f"{len(fresh)} new paper(s) from {len(topics)} topic(s)"
+
+
+def watch_loop() -> None:
+    """Queue the topic watch when a topic is due (default: once a day)."""
+    while True:
+        try:
+            every = float(CFG["watch"].get("every_hours", 24)) * 3600
+            due = False
+            for t in pdlib.topics_load():
+                last = t.get("last_run")
+                age = (dt.datetime.now() - dt.datetime.fromisoformat(last)).total_seconds() if last else None
+                due = due or age is None or age > every
+            busy = any(j["kind"] == "watch" and j["status"] in ("queued", "running") for j in list_jobs(20))
+            if due and not busy:
+                new_job("watch", "Topic watch", {})
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        time.sleep(1800)
+
+
+def topics_action(body: dict) -> dict:
+    op, job = body.get("op"), None
+    if op == "add":
+        ts = pdlib.topic_add(str(body.get("name") or ""), str(body.get("query") or ""))
+        job = new_job("watch", f"Topic watch: {ts[-1]['name']}", {"topic": ts[-1]["id"]})
+    elif op == "remove":
+        pdlib.topic_remove(str(body.get("id")))
+    elif op == "run":
+        if not pdlib.topics_load():
+            raise ValueError("add a topic first")
+        job = new_job("watch", "Topic watch", {})
+    else:
+        raise ValueError(f"unknown op {op}")
+    return {"topics": pdlib.topics_load(), "job": job}
+
+
+def k_rm_connect(spec: dict, log: Path) -> str:
+    with log.open("a") as f:
+        rmp.connect(spec["code"], f)
+    add_event("remarkable", "✒️ reMarkable connected", "Send to reMarkable is now on.")
+    return "reMarkable connected"
+
+
+JOB_KINDS = {"rm_connect": k_rm_connect, "watch": k_watch, "literature": k_literature, "remarkable": k_remarkable, "rm_draft": k_rm_draft,
              "rm_draftpull": k_rm_draftpull, "rm_pull": k_rm_pull, "rm_transfer": k_rm_transfer,
              "rm_archive": k_rm_archive, "rm_delete": k_rm_delete}
 
@@ -713,8 +857,8 @@ def requeue_interrupted() -> None:
 
 
 def scout_watch() -> None:
-    """Event when the scout loop records new picks."""
-    while True:
+    """Event when the scout loop records new picks (box profile)."""
+    while BOX:
         try:
             ids = [p["id"] for p in scout_items()]
             with LOCK:
@@ -751,13 +895,15 @@ def do_action(body: dict) -> dict:
     elif action in ("literature", "include"):
         target = body.get("target")
         if action == "include" and target not in PAPERS:
-            raise ValueError("target must be one of p0..p3")
+            raise ValueError("unknown target; configured: " + (", ".join(PAPERS) or "none"))
         set_item(pid, paper, status="pending")
         what = f"Include in {target.upper()}" if action == "include" else "Add to literature"
         job = new_job("literature", f"{what}: {item['title'][:70]}",
                       {"paper": item, "target": target if action == "include" else None,
                        "toread": bool(body.get("toread")), "pid_item": pid, "prev_status": prev})
     elif action == "remarkable":
+        if not rm_available():
+            raise ValueError("the reMarkable is not set up on this desk")
         set_item(pid, paper, status="pending")
         job = new_job("remarkable", f"To reMarkable: {item['title'][:70]}",
                       {"paper": item, "pid_item": pid, "prev_status": prev})
@@ -769,6 +915,10 @@ def do_action(body: dict) -> dict:
 def rm_action(body: dict) -> dict:
     op = body.get("op")
     pid, path = body.get("pid"), body.get("path")
+    if not rm_available():
+        raise ValueError("the reMarkable is not set up on this desk")
+    if op in ("draft", "draftpull", "transfer") and not BOX:
+        raise ValueError("drafts are not available on this desk")
     if op in ("draft", "draftpull", "transfer") and pid not in PAPERS:
         raise ValueError("pid must be one of p0..p3")
     if op in ("pull", "archive", "delete") and not (path and path.startswith("/")):
@@ -784,6 +934,8 @@ def rm_action(body: dict) -> dict:
 
 
 def rm_ls(path: str) -> dict:
+    if not rm_available():
+        raise ValueError("the reMarkable is not set up on this desk")
     r = rmp.rmapi("ls", path)
     if r.returncode != 0:
         raise ValueError((r.stderr or r.stdout).strip()[-200:])
@@ -797,6 +949,8 @@ def rm_ls(path: str) -> dict:
 
 
 def rm_drafts() -> dict:
+    if not BOX:
+        return {"papers": []}
     drafts = rmp.load_state().get("_drafts", {})
     pulled = {p.name for p in (ANNOT / "drafts").glob("*.pdf")} if (ANNOT / "drafts").exists() else set()
     out = []
@@ -830,6 +984,51 @@ def apk_version() -> int:
         return int(f.read_text().strip())
     except (OSError, ValueError):
         return 0
+
+
+def public_url(host_header: str = "") -> str:
+    if CFG.get("public_url"):
+        return str(CFG["public_url"]).rstrip("/")
+    return f"https://{host_header}" if host_header else ""
+
+
+PAIR_CSS = """*{box-sizing:border-box}body{margin:0;background:#F5F1E8;color:#141414;font:17px/1.45 system-ui,sans-serif}
+main{max-width:520px;margin:0 auto;padding:24px 16px 48px}h1{font-size:30px;letter-spacing:.02em;margin:16px 0 4px}
+.rule{height:4px;background:#141414;margin:12px 0 24px}.step{display:flex;gap:16px;margin:0 0 28px}
+.mark{flex:none;width:36px;height:36px;margin-top:2px}.step h2{font-size:19px;margin:0 0 4px}.step p{margin:0 0 12px}
+a.btn{display:inline-block;padding:14px 20px;border:2px solid #141414;color:#141414;text-decoration:none;font-weight:700}
+a.go{background:#1E4FA3;color:#fff}code{font-size:13px;word-break:break-all;background:#fff;border:1px solid #141414;
+padding:8px;display:block}small{color:#444}"""
+MARK = {"sq": '<svg class="mark" viewBox="0 0 36 36"><rect width="36" height="36" fill="#D8232A"/></svg>',
+        "tri": '<svg class="mark" viewBox="0 0 36 36"><path d="M18 2 36 34H0Z" fill="#F2C200"/></svg>',
+        "ci": '<svg class="mark" viewBox="0 0 36 36"><circle cx="18" cy="18" r="18" fill="#1E4FA3"/></svg>'}
+
+
+def pair_page(code: str, host: str) -> tuple[int, str]:
+    import html
+    head = ('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">'
+            f"<title>PaperDesk pairing</title><style>{PAIR_CSS}</style><main>"
+            f"<h1>PaperDesk</h1><div>{html.escape(str(CFG['name']))}</div><div class=rule></div>")
+    if not pdlib.pair_check(code):
+        return 403, head + (f'<div class=step>{MARK["sq"]}<div><h2>This pairing link has expired</h2><p>Links work for '
+                            "30 minutes. Run <b>paperdesk pair</b> on your machine to get a new one.</p></div></div></main>")
+    base = public_url(host)
+    link = pdlib.pair_link(base, TOKEN_FILE.read_text().strip(), str(CFG["name"]), str(CFG.get("agent_url") or ""))
+    if (DIST / "paperdesk.apk").exists():
+        get_app = '<a class=btn href="/download/paperdesk.apk">Download the app (APK)</a>'
+    else:
+        get_app = ('<a class=btn href="https://github.com/joernmht/PaperDesk/releases/latest">Get the app (APK)</a>')
+    e = html.escape
+    return 200, head + f"""
+<div class=step>{MARK["sq"]}<div><h2>1 · Install the app</h2><p>Android only. Your phone will ask whether to allow
+installing from the browser; that is expected for an app outside the Play Store.</p>{get_app}</div></div>
+<div class=step>{MARK["tri"]}<div><h2>2 · Connect</h2><p>With the app installed, tap here. It opens PaperDesk and
+connects it to this desk.</p><a class="btn go" href="{e(link)}">Connect PaperDesk</a></div></div>
+<div class=step>{MARK["ci"]}<div><h2>Nothing happens?</h2><p>Copy this pairing link and paste it into the app
+(Setup → Paste pairing link):</p><code>{e(link)}</code>
+<p><small>The link contains the key to your desk. Do not share it. This page stops working 30 minutes after
+it was created.</small></p></div></div></main>"""
 
 
 class H(BaseHTTPRequestHandler):
@@ -872,6 +1071,14 @@ class H(BaseHTTPRequestHandler):
             with apk.open("rb") as f:
                 shutil.copyfileobj(f, self.wfile)
             return
+        if p == "/api/pair" and method == "GET":
+            if not pdlib.pair_check(q.get("code", "")):
+                return self._send(403, {"error": "expired or wrong pairing code"})
+            return self._send(200, {"url": public_url(self.headers.get("Host", "")), "token": TOKEN_FILE.read_text().strip(),
+                                    "name": CFG["name"], "agent": CFG.get("agent_url") or ""})
+        if (p.startswith("/pair/") or p == "/pair") and method == "GET":
+            code, page = pair_page(p[6:] or q.get("c", ""), self.headers.get("Host", ""))
+            return self._send(code, body=page.encode(), ctype="text/html; charset=utf-8")
         if not (p.startswith("/api/") or p.startswith("/files/")):
             return self._send(404, {"error": "not found"})
         if not self._authed():
@@ -879,7 +1086,11 @@ class H(BaseHTTPRequestHandler):
         try:
             if method == "GET":
                 if p == "/api/health":
-                    return self._send(200, {"ok": True, "version": VERSION, "apk_version": apk_version()})
+                    return self._send(200, {"ok": True, "version": VERSION, "apk_version": apk_version(),
+                                            "name": CFG["name"], "profile": CFG["profile"], "features": features(),
+                                            "targets": [{"id": k, "label": v[0]} for k, v in PAPERS.items()]})
+                if p == "/api/topics":
+                    return self._send(200, {"topics": pdlib.topics_load()})
                 if p == "/api/inbox":
                     return self._send(200, {"items": inbox(q.get("status", "open"))})
                 if p == "/api/search":
@@ -917,6 +1128,15 @@ class H(BaseHTTPRequestHandler):
                     return self._send(200, do_action(self._body()))
                 if p == "/api/rm/action":
                     return self._send(200, rm_action(self._body()))
+                if p == "/api/topics":
+                    return self._send(200, topics_action(self._body()))
+                if p == "/api/rm/connect":
+                    if not features()["rm_connect"]:
+                        raise ValueError("reMarkable is switched off in config.toml")
+                    code = re.sub(r"\s+", "", str(self._body().get("code") or ""))
+                    if not re.fullmatch(r"[A-Za-z0-9]{8}", code):
+                        raise ValueError("the one-time code has 8 letters")
+                    return self._send(200, {"job": new_job("rm_connect", "Connect reMarkable", {"code": code})})
                 if p == "/api/crash":
                     trace = str(self._body().get("trace", ""))[:20000]
                     with (STATE_DIR / "crash.log").open("a") as f:
@@ -943,16 +1163,59 @@ def serve(port: int) -> None:
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=scout_watch, daemon=True).start()
     threading.Thread(target=warm_text_cache, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
-    print(f"{now()} PaperDesk {VERSION} on 127.0.0.1:{port}", file=sys.stderr, flush=True)
+    if CFG["watch"].get("enabled", True):
+        threading.Thread(target=watch_loop, daemon=True).start()
+    if LIBRARY is not None:
+        LIBRARY.ensure()
+    srv = ThreadingHTTPServer((str(CFG.get("bind") or "127.0.0.1"), port), H)
+    print(f"{now()} PaperDesk {VERSION} ({CFG['profile']}) on 127.0.0.1:{port}", file=sys.stderr, flush=True)
     srv.serve_forever()
+
+
+def cmd_pair() -> int:
+    base = public_url()
+    if not base:
+        print("No public_url in ~/.config/paperdesk/config.toml yet. The phone needs an https address for this\n"
+              "machine: run ./install.sh again once Tailscale is up, or set public_url by hand.", file=sys.stderr)
+        return 1
+    code = pdlib.pair_new()
+    url = f"{base}/pair/{code}"
+    qr = pdlib.qr_terminal(url)
+    print()
+    if qr:
+        print(qr + "\n")
+    print(f"   Address   {urllib.parse.urlparse(base).netloc}")
+    print(f"   Code      {code}          (valid 30 minutes)")
+    print(f"   Link      {url}\n")
+    return 0
+
+
+def cmd_status() -> int:
+    f = features()
+    try:
+        r = pdlib.get(f"http://127.0.0.1:{CFG['port']}/api/health", timeout=5,
+                      headers={"Authorization": "Bearer " + TOKEN_FILE.read_text().strip()})
+        up = "running" if r is not None and r.status_code == 200 else "NOT answering"
+    except OSError:
+        up = "NOT answering"
+    print(f"PaperDesk {VERSION} · {CFG['name']} · profile {CFG['profile']}")
+    print(f"  server      {up} on 127.0.0.1:{CFG['port']}")
+    print(f"  phone URL   {public_url() or '(not set: see install.sh / Tailscale)'}")
+    if LIBRARY is not None:
+        print(f"  library     {LIBRARY.root} ({len(LIBRARY.load_entries())} entries)")
+    print(f"  topics      {len(pdlib.topics_load())} followed" if f["topics"] else "  topics      off")
+    print(f"  reMarkable  {'connected' if f['remarkable'] else 'not connected (app: Settings > reMarkable)'}")
+    print(f"  targets     {', '.join(PAPERS) or 'none'}")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve")
-    s.add_argument("--port", type=int, default=8799)
+    s.add_argument("--port", type=int, default=int(CFG["port"]))
+    sub.add_parser("pair")
+    sub.add_parser("status")
     e = sub.add_parser("event")
     e.add_argument("--kind", default="notify")
     e.add_argument("--title", required=True)
@@ -961,6 +1224,10 @@ def main() -> int:
     a = ap.parse_args()
     if a.cmd == "serve":
         serve(a.port)
+    elif a.cmd == "pair":
+        return cmd_pair()
+    elif a.cmd == "status":
+        return cmd_status()
     else:
         add_event(a.kind, a.title, a.body, a.ref)
     return 0

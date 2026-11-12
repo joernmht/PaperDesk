@@ -11,17 +11,135 @@ import java.net.URLEncoder
 
 class ApiException(msg: String) : Exception(msg)
 
-/** Settings: base URL + token, defaults baked in at build time (BuildConfig), overridable in-app. */
+/** Settings: base URL + token. Set by a pairing link (paperdesk://pair?…) or by hand; a private build may bake defaults in. */
 object Prefs {
     private fun sp(ctx: Context) = ctx.getSharedPreferences("paperdesk", Context.MODE_PRIVATE)
     fun url(ctx: Context): String = (sp(ctx).getString("url", null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEFAULT_URL).trimEnd('/')
     fun token(ctx: Context): String = sp(ctx).getString("token", null)?.takeIf { it.isNotBlank() } ?: BuildConfig.DEFAULT_TOKEN
     fun save(ctx: Context, url: String, token: String) = sp(ctx).edit().putString("url", url.trim()).putString("token", token.trim()).apply()
-    /** Chat agent (~/PaperDesk/agent): same host, port 8448 instead of 8447, unless overridden. */
-    fun agentUrl(ctx: Context): String = sp(ctx).getString("agent_url", null)?.takeIf { it.isNotBlank() }?.trimEnd('/')
-        ?: url(ctx).replace(":8447", ":8448")
+    /** Without a server URL and a token the app shows the setup screen and stays silent (no polling, no crash reports). */
+    fun configured(ctx: Context): Boolean = url(ctx).isNotBlank() && token(ctx).isNotBlank()
+    fun name(ctx: Context): String = sp(ctx).getString("name", null).orEmpty()
+    /** Chat agent: explicit URL (pairing link / build default); else, on the classic port layout, 8447 → 8448. "" = none. */
+    fun agentUrl(ctx: Context): String = (sp(ctx).getString("agent_url", null)?.takeIf { it.isNotBlank() }
+        ?: BuildConfig.DEFAULT_AGENT_URL.takeIf { it.isNotBlank() }
+        ?: url(ctx).takeIf { ":8447" in it }?.replace(":8447", ":8448")
+        ?: "").trimEnd('/')
     fun lastSeq(ctx: Context): Int = sp(ctx).getInt("last_seq", -1)
     fun setLastSeq(ctx: Context, v: Int) = sp(ctx).edit().putInt("last_seq", v).apply()
+    /** Last /api/health answer, so the tabs match the server's features before the first request returns. */
+    fun serverInfo(ctx: Context): ServerInfo =
+        sp(ctx).getString("server_info", null)?.let { runCatching { ServerInfo.from(JSONObject(it)) }.getOrNull() } ?: ServerInfo.LEGACY
+    fun setServerInfo(ctx: Context, health: JSONObject) = sp(ctx).edit().putString("server_info", health.toString()).apply()
+
+    /** Connect to a (new) server: everything tied to the old one is forgotten. */
+    fun pair(ctx: Context, p: Pairing) = sp(ctx).edit()
+        .putString("url", p.url).putString("token", p.token)
+        .putString("agent_url", p.agent.orEmpty()).putString("name", p.name.orEmpty())
+        .remove("server_info").remove("last_seq").apply()
+
+    fun disconnect(ctx: Context) = sp(ctx).edit().remove("url").remove("token").remove("agent_url").remove("name")
+        .remove("server_info").remove("last_seq").remove("setup_step").remove("setup_solo").apply()
+
+    private val CONN = listOf("url", "token", "agent_url", "name", "server_info")
+    /** The current connection, to put back when a new pairing turns out not to work. */
+    fun snapshot(ctx: Context): Map<String, String?> = CONN.associateWith { sp(ctx).getString(it, null) }
+    fun restore(ctx: Context, snap: Map<String, String?>) = sp(ctx).edit().apply {
+        snap.forEach { (k, v) -> if (v == null) remove(k) else putString(k, v) }
+    }.apply()
+
+    /**
+     * Setup wizard position (ui/Setup.kt), -1 = not in the wizard. Unpaired apps are always in it (steps 0–4);
+     * paired ones only while they finish it (5–7) or after "Run setup again" (4). A build with baked-in
+     * defaults is paired from the start and never sees it.
+     */
+    fun setupStep(ctx: Context): Int {
+        val v = sp(ctx).getInt("setup_step", -1)
+        return if (!configured(ctx)) v.coerceIn(0, 4) else if (v >= 4) v else -1
+    }
+    fun setSetupStep(ctx: Context, step: Int, solo: Boolean = false) =
+        sp(ctx).edit().putInt("setup_step", step).putBoolean("setup_solo", solo && step >= 0).apply()
+    /** True when one wizard step was opened on its own from Settings (reMarkable: connect). */
+    fun setupSolo(ctx: Context): Boolean = sp(ctx).getBoolean("setup_solo", false)
+}
+
+/** A pairing link: paperdesk://pair?url=<server base URL>&token=<bearer token>[&agent=<agent base URL>][&name=<desk name>] */
+data class Pairing(val url: String, val token: String, val agent: String?, val name: String?) {
+    val host: String get() = runCatching { android.net.Uri.parse(url).host }.getOrNull() ?: url
+    val display: String get() = name?.takeIf { it.isNotBlank() } ?: host
+
+    companion object {
+        fun parse(link: String?): Pairing? {
+            val u = runCatching { android.net.Uri.parse(link?.trim().orEmpty()) }.getOrNull() ?: return null
+            if (u.scheme != "paperdesk" || u.host != "pair") return null
+            fun q(k: String) = runCatching { u.getQueryParameter(k) }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+            val url = q("url")?.trimEnd('/') ?: return null
+            val token = q("token") ?: return null
+            if (!url.startsWith("https://") && !url.startsWith("http://")) return null
+            val agent = q("agent")?.trimEnd('/')?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+            return Pairing(url, token, agent, q("name")?.take(60))
+        }
+    }
+}
+
+class PairException(msg: String) : Exception(msg)
+
+/** Turns what the installer shows (QR code, or machine address + pairing code) into a [Pairing]. */
+object PairClient {
+    /** XXXX-XXXX, typed in any case, with or without the dash. */
+    fun normCode(s: String): String? {
+        val c = s.uppercase().filter { it.isLetterOrDigit() }
+        return if (c.length == 8) c.substring(0, 4) + "-" + c.substring(4) else null
+    }
+
+    /** `myvm.tail1234.ts.net`, `https://myvm…`, with or without a port (default 8447). https only. */
+    fun origin(address: String): String? {
+        var a = address.trim().trimEnd('/')
+        if (a.startsWith("http://", ignoreCase = true)) return null
+        if (a.startsWith("https://", ignoreCase = true)) a = a.substring(8)
+        a = a.substringBefore('/')
+        if (a.isBlank() || a.any { it.isWhitespace() } || !a.contains('.')) return null
+        val port = a.substringAfterLast(':', "")
+        return "https://" + if (port.isNotEmpty() && port.all(Char::isDigit)) a else "$a:8447"
+    }
+
+    /** QR text `https://<host>[:port]/pair/<CODE>` → (origin, code). */
+    fun fromQr(text: String): Pair<String, String>? {
+        val u = runCatching { android.net.Uri.parse(text.trim()) }.getOrNull() ?: return null
+        val seg = u.pathSegments ?: return null
+        if (u.scheme != "https" || u.encodedAuthority.isNullOrBlank() || seg.size != 2 || seg[0] != "pair") return null
+        val code = normCode(seg[1]) ?: return null
+        return "https://${u.encodedAuthority}" to code
+    }
+
+    /** GET <origin>/api/pair?code=… (no auth: the short-lived code is the secret). */
+    suspend fun fetch(origin: String, code: String): Pairing = withContext(Dispatchers.IO) {
+        val c = try {
+            URL("$origin/api/pair?code=" + URLEncoder.encode(code, "UTF-8")).openConnection() as HttpURLConnection
+        } catch (e: Exception) {
+            throw PairException("That machine address does not look right.")
+        }
+        try {
+            c.connectTimeout = 12_000; c.readTimeout = 15_000
+            c.setRequestProperty("Accept", "application/json")
+            val status = c.responseCode
+            val text = (if (status in 200..299) c.inputStream else c.errorStream)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            when {
+                status == 403 -> throw PairException("That code is wrong or has expired. Codes last 30 minutes: run `paperdesk pair` on the machine for a new one.")
+                status !in 200..299 -> throw PairException("The machine answered, but not with a pairing (HTTP $status). Is PaperDesk installed and up to date there?")
+            }
+            val o = runCatching { JSONObject(text) }.getOrNull() ?: throw PairException("The machine sent an answer PaperDesk cannot read.")
+            val token = o.optString("token").takeIf { it.isNotBlank() } ?: throw PairException("The machine sent no access token.")
+            Pairing(o.optString("url").trimEnd('/').ifBlank { origin }, token,
+                o.optString("agent").trimEnd('/').takeIf { it.startsWith("http") }, o.optString("name").takeIf { it.isNotBlank() })
+        } catch (e: PairException) {
+            throw e
+        } catch (e: Exception) {
+            throw PairException("Can't reach the machine. Is Tailscale on, on both devices?")
+        } finally {
+            c.disconnect()
+        }
+    }
 }
 
 class Api(private val ctx: Context) {
@@ -115,6 +233,20 @@ class Api(private val ctx: Context) {
             c.disconnect()
         }
         out
+    }
+
+    /** One-time code from my.remarkable.com/device/desktop/connect → a job that registers the server with the tablet. */
+    suspend fun rmConnect(code: String): Job? =
+        post("/api/rm/connect", JSONObject().put("code", code)).optJSONObject("job")?.let(Job::from)
+
+    suspend fun topics() = get("/api/topics").optJSONArray("topics").mapObjects(Topic::from)
+
+    /** op = add (name + query) | remove (id) | run. Returns (topics, job or null). */
+    suspend fun topicsOp(op: String, name: String? = null, query: String? = null, id: String? = null): Pair<List<Topic>, Job?> {
+        val b = JSONObject().put("op", op)
+        name?.let { b.put("name", it) }; query?.let { b.put("query", it) }; id?.let { b.put("id", it) }
+        val r = post("/api/topics", b)
+        return r.optJSONArray("topics").mapObjects(Topic::from) to r.optJSONObject("job")?.let(Job::from)
     }
 
     fun apkUrl() = "$base/download/paperdesk.apk"
