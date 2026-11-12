@@ -29,13 +29,26 @@ android {
         buildConfigField("String", "DEFAULT_AGENT_URL", "\"${lp("paperdesk.agent")}\"")
         buildConfigField("boolean", "PUBLIC_BUILD", "$publicBuild")
     }
+    // Public builds are signed with the PaperDesk release key (keystore + password file outside the repo,
+    // default ~/.config/paperdesk/release.{jks,pass}); Joern's private build stays on the debug key so his
+    // installed app keeps updating. Updates of an installed app must always use the same key.
+    val ks = file((findProperty("paperdesk.keystore") as String?) ?: "${System.getProperty("user.home")}/.config/paperdesk/release.jks")
+    val ksPass = file(ks.path.removeSuffix(".jks") + ".pass")
+    if (publicBuild && ks.exists() && ksPass.exists()) {
+        signingConfigs.create("paperdesk") {
+            storeFile = ks
+            storePassword = ksPass.readText().trim()
+            keyAlias = "paperdesk"
+            keyPassword = ksPass.readText().trim()
+        }
+    }
     buildTypes {
-        // R8-shrunk build (56 MB debug → a few MB; icons-extended is huge). Debug-signed.
+        // R8-shrunk build (56 MB debug → a few MB; icons-extended is huge).
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("paperdesk") ?: signingConfigs.getByName("debug")
         }
     }
     buildFeatures { compose = true; buildConfig = true }

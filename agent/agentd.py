@@ -95,9 +95,13 @@ GitHub: use the github_* tools to read repos, issues, PRs, files and CI runs.
 
 Repos in this chat: WRITABLE ones live at /workspace/<name> on a work branch (only these can become a PR);
 READ-ONLY ones at /workspace/ro/<name> (reference material; you cannot change them; repos that have a checkout
-on Joern's box show its live state, incl. uncommitted work, with secret files blanked). Attach more
-reference repos yourself with clone_repo_readonly. Need to change a repo that is not writable yet?
-Call clone_repo_writable (Joern approves). list_workspace shows what is attached.
+on Joern's box show its live state, incl. uncommitted work, with secret files blanked). list_workspace
+shows what is attached.
+SCOPE: when Joern attached repos, they ARE the scope of his request. Do not look at, list or clone other
+repos unless his message names them (the tools refuse otherwise). Typical roles: the read-only repo(s) are
+what the work is about or reference material (style, templates); the writable one is where results go.
+"Changes of the last day" means the commits/PRs/issues of the attached subject repo(s), nothing else.
+With no repos attached you may use clone_repo_readonly / clone_repo_writable freely.
 
 Coding workflow (when asked to change code):
 1. Make sure the repo is attached writable (see the list below, or clone_repo_writable).
@@ -195,7 +199,7 @@ def build_agent(row: dict):
     llm = _llm_class()(model=model_name, base_url=m["base_url"], api_key=os.environ[m["api_key_env"]],
                        temperature=m.get("temperature", 0.3), timeout=m.get("timeout", 120), max_retries=2,
                        pd_provider="openai" if row["subagents"] else SOLO, **extra)
-    tools, interrupt_on = ghtools.make_tools(tid, POLICY)
+    tools, interrupt_on = ghtools.make_tools(tid, POLICY, scope=lambda: chat_scope(tid))
     # files + shell in the chat's container; offloaded context stays in the checkpointed state
     backend = CompositeBackend(default=sandbox.DockerSandbox(tid), routes={"/_agent/": StateBackend()},
                                artifacts_root="/_agent")
@@ -383,6 +387,20 @@ def thread_row(tid: str) -> dict | None:
     return _row(r) if r else None
 
 
+CURRENT_TEXT: dict[str, str] = {}  # tid -> the user message of the running turn (not flushed to pd_events yet)
+
+
+def chat_scope(tid: str) -> tuple[set[str], str]:
+    """(repos Joern attached to this chat, lowercased text of his messages in it) for ghtools' scope check."""
+    row = thread_row(tid) or {}
+    allowed = {r["repo"].lower() for r in row.get("repos") or []}
+    with EV_LOCK:
+        evs = EV_DB.execute("SELECT ev FROM pd_events WHERE tid=? AND ev LIKE '%\"type\": \"start\"%'",
+                            (tid,)).fetchall()
+    texts = [json.loads(e[0]).get("text") or "" for e in evs]
+    return allowed, " ".join(texts + [CURRENT_TEXT.get(tid, "")]).lower()
+
+
 def attach(tid: str, repo: str, mode: str) -> dict:
     """Joern-initiated attach (chat setup or the app's repo picker): his choice is the approval."""
     if mode == "write":
@@ -511,6 +529,7 @@ def _run_main(run: Run, inp, label: str) -> None:
     send its next message or approval at once. Only a cancel sends done early (closing may take a while)."""
     term = None
     try:
+        CURRENT_TEXT[run.tid] = label or ""
         run.emit({"type": "start", "kind": run.kind, "text": label, "model": run.row["model"]})
         for ev in _turn_events(run, inp):
             if ev["type"] in TERMINAL and not ev.get("cancelled"):
