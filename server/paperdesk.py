@@ -46,7 +46,7 @@ from pathlib import Path
 import papers as pp
 import pdlib
 
-VERSION = "0.2"
+VERSION = "0.3"
 HOME = Path.home()
 CFG = pdlib.load_config()
 BOX = CFG["profile"] == "box"
