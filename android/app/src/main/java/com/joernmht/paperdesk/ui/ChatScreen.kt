@@ -693,7 +693,7 @@ private fun StepsDropdown(app: AppCtx, steps: List<ChatItem>, running: Boolean, 
         else -> "${boxes.size} step${if (boxes.size == 1) "" else "s"}" + (if (failed > 0) " · $failed failed" else "")
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-        .border(BorderW, MaterialTheme.colorScheme.onSurface, RectangleShape)) {
+        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))) {
         Row(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically) {
             if (running) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -750,8 +750,7 @@ private fun StepBox(app: AppCtx, s: ChatItem.Step) {
     val failed = s.ok == false
     val border = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)
-        .border(BorderW, border, RectangleShape)
-        .background(if (failed) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface, RectangleShape)
+        .background(if (failed) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f) else androidx.compose.ui.graphics.Color.Transparent, RectangleShape)
         .clickable { expanded = !expanded }
         .padding(horizontal = 10.dp, vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -820,7 +819,9 @@ private fun PlanPanel(todos: List<TodoItem>) {
 private fun ApprovalCard(a: ChatItem.Approval, enabled: Boolean, onDecide: (Boolean, String?) -> Unit) {
     var reason by remember { mutableStateOf("") }
     var rejecting by remember { mutableStateOf(false) }
-    BCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp), container = MaterialTheme.colorScheme.tertiaryContainer) {
+    // the one framed card: it waits for a decision
+    BCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp), framed = a.state == "pending",
+        container = if (a.state == "pending") MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Form(FormKind.Triangle, 14.dp, label = "waiting")

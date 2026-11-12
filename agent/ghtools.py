@@ -2,7 +2,8 @@
 
 Read tools work on any repo the login can see, except the deny list. Write tools (comment, issue,
 writable clone, pull request) are limited to `write_owners`; in "ask" chats agentd gates them behind
-Joern's approval, in "auto" chats (the default) they run directly.
+the user's approval, in "auto" chats (the default) they run directly.
+On the box the login is the box's `gh` login; on a portable install `GH_TOKEN` (from GITHUB_TOKEN).
 """
 from __future__ import annotations
 
@@ -23,13 +24,17 @@ GATED = {"github_comment", "github_create_issue", "open_pull_request", "clone_re
 class Policy:
     def __init__(self, cfg: dict):
         self.deny = {r.lower() for r in cfg.get("deny", [])}
-        self.write_owners = {o.lower() for o in cfg.get("write_owners", ["joernmht"])}
-        self.default_owner = cfg.get("default_owner", "joernmht")
-        self.identity = (cfg.get("author_name", "Joern Maurischat"), cfg.get("author_email", ""))
+        self.write_owners = {o.lower() for o in cfg.get("write_owners", [])}
+        self.default_owner = cfg.get("default_owner", "")
+        self.identity = (cfg.get("author_name", "PaperDesk agent"), cfg.get("author_email", ""))
+        self.user = cfg.get("user", "the user")    # how messages name the person ("Joern" on the box)
+        self.he = cfg.get("he", "they")
 
     def check(self, repo: str, write: bool = False) -> str:
         repo = repo.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
         if "/" not in repo:  # models often drop the owner
+            if not self.default_owner:
+                raise ValueError(f"not a repo name: {repo!r} (use owner/name)")
             repo = f"{self.default_owner}/{repo}"
         if not sandbox.REPO_RE.match(repo):
             raise ValueError(f"not a repo name: {repo!r} (use owner/name)")
@@ -55,9 +60,9 @@ def _err(e: Exception) -> str:
 BROAD = re.compile(r"\b(all|every|other|which|any)\b[^.?!\n]{0,25}\brepo", re.I)
 
 
-def scope_error(repo: str, allowed: set[str]) -> str:
-    return (f"{repo} is outside this chat: Joern limited it to {', '.join(sorted(allowed))}. Work only with "
-            "those. If another repo is really needed, say so in your answer; he can add it in the app.")
+def scope_error(repo: str, allowed: set[str], user: str = "the user", he: str = "they") -> str:
+    return (f"{repo} is outside this chat: {user} limited it to {', '.join(sorted(allowed))}. Work only with "
+            f"those. If another repo is really needed, say so in your answer; {he} can add it in the app.")
 
 
 def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
@@ -76,18 +81,19 @@ def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
         if (not allowed or repo.lower() in allowed or BROAD.search(text)
                 or re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text)):
             return repo
-        raise PermissionError(scope_error(repo, allowed))
+        raise PermissionError(scope_error(repo, allowed, policy.user, policy.he))
 
     @tool
-    def github_list_repos(owner: str = "joernmht", limit: int = 40) -> str:
+    def github_list_repos(owner: str = "", limit: int = 40) -> str:
         """List a GitHub owner's repositories (name, visibility, description, last push)."""
         if scope is not None:
             allowed, text = scope()
             if allowed and not BROAD.search(text):
-                return ("ERROR: not needed: this chat is limited to the repos Joern attached: "
+                return (f"ERROR: not needed: this chat is limited to the repos {policy.user} attached: "
                         + ", ".join(sorted(allowed)) + ". Use those.")
         try:
-            return _gh("repo", "list", owner, "--limit", str(min(limit, 100)), "--json",
+            owner = owner or policy.default_owner
+            return _gh("repo", "list", *([owner] if owner else []), "--limit", str(min(limit, 100)), "--json",
                        "nameWithOwner,visibility,description,pushedAt,isFork,isArchived")
         except Exception as e:
             return _err(e)
@@ -193,7 +199,7 @@ def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
         try:
             repo = chk(repo, write=True)
             out = _gh("api", f"repos/{repo}/issues/{int(number)}/comments", "-f",
-                      f"body={body}\n\n<sub>Posted by the PaperDesk agent for Joern.</sub>",
+                      f"body={body}\n\n<sub>Posted by the PaperDesk agent for {policy.user}.</sub>",
                       "--jq", ".html_url")
             return f"Comment posted: {out.strip()}"
         except Exception as e:
@@ -205,7 +211,7 @@ def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
         try:
             repo = chk(repo, write=True)
             out = _gh("issue", "create", "-R", repo, "--title", title, "--body",
-                      body + "\n\n<sub>Opened by the PaperDesk agent for Joern.</sub>")
+                      body + f"\n\n<sub>Opened by the PaperDesk agent for {policy.user}.</sub>")
             return f"Issue opened: {out.strip().splitlines()[-1]}"
         except Exception as e:
             return _err(e)
@@ -224,7 +230,7 @@ def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
 
     @tool
     def clone_repo_writable(repo: str, base_branch: str = "") -> str:
-        """Attach one of Joern's repos WRITABLE at /workspace/<name> on a fresh work branch, for changes
+        """Attach one of the user's repos WRITABLE at /workspace/<name> on a fresh work branch, for changes
         that end in a pull request. Skip it if the repo is already attached writable."""
         try:
             repo = chk(repo, write=True)
@@ -257,7 +263,7 @@ def make_tools(tid: str, policy: Policy, scope=None) -> tuple[list, dict]:
                 raise RuntimeError(f"'{repo_dir_name}' is not a writable repo in this chat")
             chk(m["repo"], write=True)
             res = sandbox.push_and_pr(tid, repo_dir_name, title, body + "\n\n---\n🤖 Opened by the PaperDesk "
-                                      "agent for Joern (code written and tested in its sandbox).", draft)
+                                      f"agent for {policy.user} (code written and tested in its sandbox).", draft)
             return json.dumps({k: res[k] for k in ("url", "updated", "branch", "stat", "commits")})
         except Exception as e:
             return _err(e)

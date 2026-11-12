@@ -170,6 +170,16 @@ data class ServerInfo(
     val agent: Boolean, val targets: List<Pair<String, String>>,
     /** The server can register itself with a reMarkable from a one-time code (setup wizard step). */
     val rmConnect: Boolean = false,
+    /** Paper repos can be added/removed from the app (portable desks). */
+    val papersEdit: Boolean = false,
+    /** TeX is installed on the server (Build PDF works). */
+    val latex: Boolean = true,
+    /** The chat agent is installed and can be configured from the app. */
+    val agentSetup: Boolean = false,
+    /** GET/POST /api/secrets exists (keys step). */
+    val secrets: Boolean = false,
+    /** The agent's base URL as the server knows it ("" = none / not configured). */
+    val agentUrl: String = "",
 ) {
     companion object {
         val LEGACY = ServerInfo("", remarkable = true, drafts = true, transfer = true, topics = false, agent = true, targets = LEGACY_TARGETS)
@@ -179,6 +189,11 @@ data class ServerInfo(
             val rm = f.optBoolean("remarkable", true)
             return ServerInfo(
                 rmConnect = f.optBoolean("rm_connect", false),
+                papersEdit = f.optBoolean("papers_edit", false), latex = f.optBoolean("latex", true),
+                agentSetup = f.optBoolean("agent_setup", false),
+                // servers that know papers_edit (0.3+) have /api/secrets; an explicit flag wins
+                secrets = f.optBoolean("secrets", f.has("papers_edit")),
+                agentUrl = o.optString("agent_url").trimEnd('/'),
                 name = o.optString("name"), remarkable = rm,
                 drafts = rm && f.optBoolean("drafts", true), transfer = rm && f.optBoolean("transfer", true),
                 topics = f.optBoolean("topics", false), agent = f.optBoolean("agent", true),
@@ -267,3 +282,62 @@ fun approvalFrom(o: JSONObject) = ChatItem.Approval(
         ApprovalAction(it.optString("name"), it.optString("kind"), it.optString("title"), argPairs(it.optJSONObject("args")))
     },
 )
+
+
+// ------------------------------------------------------------------ papers (Paper tab, editor)
+
+data class PaperHead(val hash: String, val date: String, val subject: String)
+
+/** A paper repo on the server. [legacy] = built from the reMarkable drafts list of a server without /api/papers. */
+data class PaperInfo(val id: String, val label: String, val branch: String, val main: String, val head: PaperHead?,
+                     val comments: Int, val rm: Boolean, val legacy: Boolean = false) {
+    companion object {
+        fun from(o: JSONObject) = PaperInfo(
+            o.optString("id"), o.optString("label", o.optString("id")), o.optString("branch"), o.optString("main"),
+            o.optJSONObject("head")?.let { PaperHead(it.optString("hash"), it.optString("date"), it.optString("subject")) },
+            o.optInt("comments"), o.optBoolean("rm"),
+        )
+    }
+}
+
+data class PaperFile(val path: String, val size: Long)
+
+/** A file as loaded for editing; [sha] = git blob sha of exactly this text (the base for saving). */
+data class FileDoc(val path: String, val text: String, val sha: String, val head: String)
+
+data class SaveResult(val sha: String, val commit: String, val pushed: Boolean, val note: String?)
+
+/** 409 on save: someone changed the file on the server since it was opened. */
+class ConflictException(val theirText: String, val theirSha: String) : Exception("changed")
+
+/** A comment in a paper (line/col 1-based). kind = mark | note | rmnote | rmhl | rmdel */
+data class PaperComment(val id: String, val kind: String, val path: String, val line: Int, val col: Int,
+                        val marked: String?, val comment: String?) {
+    val fromTablet get() = kind.startsWith("rm")
+    companion object {
+        fun from(o: JSONObject) = PaperComment(o.optString("id"), o.optString("kind"), o.optString("path"),
+            o.optInt("line", 1), o.optInt("col", 1),
+            if (o.isNull("marked")) null else o.optString("marked"), if (o.isNull("comment")) null else o.optString("comment"))
+    }
+}
+
+// ------------------------------------------------------------------ keys + agent setup
+
+data class Secret(val name: String, val label: String, val help: String, val url: String?, val set: Boolean, val optional: Boolean) {
+    companion object {
+        fun from(o: JSONObject) = Secret(o.optString("name"), o.optString("label", o.optString("name")), o.optString("help"),
+            if (o.isNull("url")) null else o.optString("url").takeIf { it.isNotBlank() }, o.optBoolean("set"), o.optBoolean("optional"))
+    }
+}
+
+data class LlmProvider(val label: String, val baseUrl: String, val model: String, val url: String?)
+
+data class AgentSetup(val baseUrl: String, val model: String, val configured: Boolean, val providers: List<LlmProvider>) {
+    companion object {
+        fun from(o: JSONObject) = AgentSetup(o.optString("base_url"), o.optString("model"), o.optBoolean("configured"),
+            o.optJSONArray("providers").mapObjects {
+                LlmProvider(it.optString("label"), it.optString("base_url"), it.optString("model"),
+                    if (it.isNull("url")) null else it.optString("url").takeIf { u -> u.isNotBlank() })
+            })
+    }
+}

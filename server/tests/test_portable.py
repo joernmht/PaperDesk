@@ -12,24 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-TMP = tempfile.mkdtemp(prefix="pdtest-")
-os.environ["PAPERDESK_CONFIG_DIR"] = TMP + "/config"
-os.environ["PAPERDESK_STATE_DIR"] = TMP + "/state"
-Path(TMP, "config").mkdir()
-Path(TMP, "config/token").write_text("s3cret-token\n")
-Path(TMP, "config/config.toml").write_text(f'''
-name = "Test desk"
-public_url = "https://desk.example.ts.net:8447"
-[library]
-dir = "{TMP}/library"
-[remarkable]
-enabled = false
-[[targets]]
-id = "thesis"
-label = "Thesis"
-bib = "{TMP}/thesis/refs.bib"
-''')
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _env import TMP  # noqa: E402  (sets up the temp desk)
 import pdlib  # noqa: E402
 import paperdesk as pd  # noqa: E402
 
@@ -93,8 +76,11 @@ class Portable(unittest.TestCase):
         code, h = self.call("/api/health")
         self.assertEqual(code, 200)
         self.assertEqual(h["profile"], "portable")
-        self.assertEqual(h["features"], {"remarkable": False, "drafts": False, "transfer": False,
-                                         "topics": True, "agent": False, "rm_connect": False})
+        f = h["features"]
+        self.assertEqual({k: f[k] for k in ("remarkable", "drafts", "transfer", "topics", "agent", "rm_connect",
+                                            "papers_edit", "secrets", "agent_setup")},
+                         {"remarkable": False, "drafts": False, "transfer": False, "topics": True, "agent": False,
+                          "rm_connect": False, "papers_edit": True, "secrets": True, "agent_setup": False})
         self.assertEqual(h["targets"], [{"id": "thesis", "label": "Thesis"}])
 
     def test_2_pairing(self):

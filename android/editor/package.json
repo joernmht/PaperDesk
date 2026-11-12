@@ -1,0 +1,22 @@
+{
+  "name": "paperdesk-editor",
+  "private": true,
+  "description": "CodeMirror 6 LaTeX editor bundled into the PaperDesk app (assets/editor/). Build: ./build.sh",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "./build.sh",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.8.0",
+    "@codemirror/language": "^6.11.0",
+    "@codemirror/legacy-modes": "^6.5.0",
+    "@codemirror/search": "^6.5.10",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.36.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "type": "module"
+}

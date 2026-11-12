@@ -9,7 +9,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-class ApiException(msg: String) : Exception(msg)
+/** [code] = HTTP status (0 = no answer), [body] = the server's JSON error body, if any. */
+class ApiException(msg: String, val code: Int = 0, val body: JSONObject? = null) : Exception(msg)
 
 /** Settings: base URL + token. Set by a pairing link (paperdesk://pair?…) or by hand; a private build may bake defaults in. */
 object Prefs {
@@ -27,6 +28,10 @@ object Prefs {
         ?: "").trimEnd('/')
     fun lastSeq(ctx: Context): Int = sp(ctx).getInt("last_seq", -1)
     fun setLastSeq(ctx: Context, v: Int) = sp(ctx).edit().putInt("last_seq", v).apply()
+    fun setAgentUrl(ctx: Context, v: String) = sp(ctx).edit().putString("agent_url", v.trimEnd('/')).apply()
+    /** Editor font size in sp, persisted. */
+    fun editorFont(ctx: Context): Int = sp(ctx).getInt("editor_font", 15)
+    fun setEditorFont(ctx: Context, v: Int) = sp(ctx).edit().putInt("editor_font", v.coerceIn(10, 28)).apply()
     /** Last /api/health answer, so the tabs match the server's features before the first request returns. */
     fun serverInfo(ctx: Context): ServerInfo =
         sp(ctx).getString("server_info", null)?.let { runCatching { ServerInfo.from(JSONObject(it)) }.getOrNull() } ?: ServerInfo.LEGACY
@@ -169,8 +174,9 @@ class Api(private val ctx: Context) {
             val text = (if (code in 200..299) c.inputStream else c.errorStream)
                 ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
             if (code !in 200..299) {
-                val err = runCatching { JSONObject(text).optString("error") }.getOrNull()
-                throw ApiException("HTTP $code" + (err?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""))
+                val o = runCatching { JSONObject(text) }.getOrNull()
+                val err = o?.optString("error")
+                throw ApiException("HTTP $code" + (err?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""), code, o)
             }
             return if (text.isBlank()) JSONObject() else JSONObject(text)
         } finally {
@@ -221,19 +227,61 @@ class Api(private val ctx: Context) {
     }
 
     /** Downloads /files/annotated/<name> into cache/pdf/ and returns the file. */
-    suspend fun downloadAnnotated(name: String): File = withContext(Dispatchers.IO) {
+    suspend fun downloadAnnotated(name: String): File =
+        download("/files/annotated/" + enc(name).replace("+", "%20"), name.replace('/', '_'))
+
+    private suspend fun download(path: String, fileName: String): File = withContext(Dispatchers.IO) {
         val dir = File(ctx.cacheDir, "pdf").apply { mkdirs() }
-        val out = File(dir, name.replace('/', '_'))
-        val c = open("/files/annotated/" + enc(name).replace("+", "%20"), timeoutMs = 120_000)
+        val out = File(dir, fileName)
+        val c = open(path, timeoutMs = 120_000)
         c.setRequestProperty("Accept", "application/pdf")
         try {
-            if (c.responseCode !in 200..299) throw ApiException("HTTP ${c.responseCode}")
+            if (c.responseCode !in 200..299) throw ApiException("HTTP ${c.responseCode}", c.responseCode)
             c.inputStream.use { inp -> out.outputStream().use { inp.copyTo(it) } }
         } finally {
             c.disconnect()
         }
         out
     }
+
+    // ---------------- papers
+    private fun pp(id: String) = "/api/papers/" + enc(id)
+
+    suspend fun papers() = get("/api/papers").optJSONArray("papers").mapObjects(PaperInfo::from)
+    /** op = add (label, git_url, main) | remove (id). Returns (papers, job or null). */
+    suspend fun paperOp(body: JSONObject): Pair<List<PaperInfo>, Job?> {
+        val r = post("/api/papers", body)
+        return r.optJSONArray("papers").mapObjects(PaperInfo::from) to r.optJSONObject("job")?.let(Job::from)
+    }
+    suspend fun paperFiles(id: String) = get(pp(id) + "/files").optJSONArray("files").mapObjects { PaperFile(it.optString("path"), it.optLong("size")) }
+    suspend fun paperFile(id: String, path: String): FileDoc {
+        val o = get(pp(id) + "/file?path=" + enc(path), 60_000)
+        return FileDoc(o.optString("path", path), o.optString("text"), o.optString("sha"), o.optString("head"))
+    }
+    /** Commits (and pushes) [text] if the file on the server is still [baseSha]; else [ConflictException]. */
+    suspend fun saveFile(id: String, path: String, text: String, baseSha: String, message: String? = null): SaveResult {
+        val b = JSONObject().put("path", path).put("text", text).put("base_sha", baseSha)
+        message?.let { b.put("message", it) }
+        val r = try {
+            withContext(Dispatchers.IO) { request(pp(id) + "/file", b, 120_000) }
+        } catch (e: ApiException) {
+            if (e.code == 409 && e.body != null) throw ConflictException(e.body.optString("text"), e.body.optString("sha"))
+            throw e
+        }
+        return SaveResult(r.optString("sha"), r.optString("commit"), r.optBoolean("pushed"), r.optString("note").takeIf { it.isNotBlank() })
+    }
+    suspend fun paperComments(id: String) = get(pp(id) + "/comments").optJSONArray("comments").mapObjects(PaperComment::from)
+    suspend fun paperBuild(id: String) = post(pp(id) + "/build", JSONObject()).optJSONObject("job")?.let(Job::from)
+    suspend fun paperPdf(id: String): File = download(pp(id) + "/pdf", "paper_" + id.replace(Regex("[^\\w.-]"), "_") + ".pdf")
+    suspend fun paperSync(id: String) = post(pp(id) + "/sync", JSONObject()).optJSONObject("head")
+
+    // ---------------- keys + agent setup
+    suspend fun secrets() = get("/api/secrets").optJSONArray("secrets").mapObjects(Secret::from)
+    suspend fun setSecret(name: String, value: String) =
+        post("/api/secrets", JSONObject().put("name", name).put("value", value)).optJSONArray("secrets").mapObjects(Secret::from)
+    suspend fun agentSetup() = AgentSetup.from(get("/api/agent-setup"))
+    suspend fun startAgentSetup(baseUrl: String, model: String) =
+        post("/api/agent-setup", JSONObject().put("base_url", baseUrl).put("model", model)).optJSONObject("job")?.let(Job::from)
 
     /** One-time code from my.remarkable.com/device/desktop/connect → a job that registers the server with the tablet. */
     suspend fun rmConnect(code: String): Job? =

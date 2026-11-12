@@ -4,29 +4,57 @@ Native Kotlin + Jetpack Compose (Material 3) client for a PaperDesk server. It t
 paired with; the API is specified in `../API.md`.
 
 Tabs: **Inbox** (new papers with *Include in…* / *Add to literature* / *Send to reMarkable* / *Dismiss*, plus
-*Topics* to follow), **Search** (library + web, same buttons), **reMarkable** (drafts, tablet browser, annotated
-PDFs), **Chat** (the agent service), **Activity** (jobs, decisions, update feed). Tabs and actions the server does
+*Topics* to follow), **Search** (library + web, same buttons), **Paper** (your LaTeX papers: edit, comment, build
+the PDF, reMarkable drafts; the tablet browser and annotated PDFs at the bottom), **Chat** (the agent service),
+**Activity** (jobs, decisions, update feed). Tabs and actions the server does
 not offer are hidden (see *Feature gating*).
 
 ## Design: Bauhaus (`ui/Bauhaus.kt`)
-Three colours, three forms, no ornament. Fixed palette (no dynamic colour): red `#D8232A`, yellow `#F2C200`,
-blue `#1E4FA3`, ink `#141414`, paper `#F5F1E8`; in dark mode the ground is ink, text is paper, blue and red are
-lightened. All corners are square, nothing casts a shadow, cards and buttons carry a 1.5 dp ink border, chrome is
-separated from content by a 2 dp ink rule. Titles and labels are set in **Jost** (variable font, SIL OFL 1.1,
+Three colours, three forms, every element does a job. Fixed palette (no dynamic colour): red `#E4002B`, yellow
+`#FFCC00`, blue `#0047BB`, ink `#141414`, paper `#F5F1E8`; in dark mode the ground is ink, text is paper, blue is
+`#4D86FF`, red `#FF4D5E`. Colour appears as solid fields where it means something: the primary action is a blue
+block with white text (8.6:1), the active bottom tab is a blue block, the current setup step is yellow (ink on
+yellow 12:1). Corners are square and nothing casts a shadow. There are no frames around list rows or cards:
+structure comes from whitespace on the 8 dp grid and 1 dp hairlines (ink at 12 %). A frame appears only where it
+carries meaning (an approval card waiting for you, a focused input). Error text stays ink next to a red square,
+because red text on paper would be 4.3:1. Titles and labels are set in **Jost** (variable font, SIL OFL 1.1,
 `res/font/jost.ttf`, licence in `licenses/Jost-OFL.txt`); body text stays the system sans so abstracts read easily.
 
 The forms carry meaning by shape, so colour is never the only signal:
 
 | Form | Means | Used for |
 |---|---|---|
-| ● blue circle | keep / known | in the library, added, done, *Include in…*, *Add to literature*, *Approve*, *Connect* |
-| ■ red square | new / stop | new inbox item, dismiss, delete, failed, every error message |
-| ▲ yellow triangle | forward / in motion | *Send to reMarkable*, pending and running jobs, later, update available, *Next* |
+| ● blue circle | keep / known | in the library, added, done, *Include in…*, *Add to literature*, *Approve*, *Connect*, your comments |
+| ■ red square | new / stop | new inbox item, dismiss, delete, failed, every error message, reMarkable marks |
+| ▲ yellow triangle | forward / in motion | *Send to reMarkable*, pending and running jobs, later, unsaved, update available, *Next* |
 
-`Form(kind, size)` draws one (always with a thin outline in the content colour, so yellow stays legible on
-paper); `statusForm()` / `actionForm()` map states and decisions to forms. Use `BCard`, `BFilledButton`,
-`BOutlinedButton`, `BTag`, `ErrorLine`, `InkRule` instead of the stock Material components, and keep spacing on
-the 8 dp grid.
+`Form(kind, size)` draws one; `statusForm()` / `actionForm()` map states and decisions to forms. Use
+`BFilledButton` (primary, one per screen), `BOutlinedButton` (secondary: no frame, form + label), `BTag`,
+`ErrorLine`, `Hairline` instead of the stock Material components.
+
+## Paper tab and editor (`ui/PaperTab.kt`, `ui/Editor.kt`, `editor/`)
+The Paper tab lists the desk's paper repos (`GET /api/papers`). A paper has **Edit** (file list → editor),
+**Build PDF** (job; the summary of a failed build names the first LaTeX error), **Open PDF**, **Pull now**, its
+**Comments** (tap one: the editor opens at that place with the comment open) and, when the desk has a reMarkable
+and the paper is sent there, the draft actions (send fresh draft, pull annotations, marks → LaTeX). Portable desks
+(`features.papers_edit`) can add a paper by git URL (Overleaf git-bridge or GitHub https) and remove it.
+
+The editor is **CodeMirror 6** (MIT, `licenses/CodeMirror-MIT.txt`) in a WebView, bundled as an asset
+(`app/src/main/assets/editor/`, no network). Its source is `editor/src/` (`editor.js` = view + bridge,
+`comments.js` = the macro parser, tested by `editor/test.mjs`); rebuild with `editor/build.sh` (node 24 +
+esbuild; on the box `source ~/.nvm/nvm.sh` first). The built bundle is committed, so gradle never needs node.
+
+Comments are LaTeX macros in the source: `\pdmark{marked text}{comment}` and `\pdnote{comment}`; the
+reMarkable's `\rmnote[..]{..}`, `\rmhl{..}`, `\rmdel{..}` are shown the same way and cannot be edited. The
+editor hides the macro syntax: a mark shows only its text (yellow ground, blue underline), a note is a small blue
+circle, a reMarkable note a red square, a deletion is struck through. *Show source* (⋮) reveals the raw macros.
+Tap one → bottom sheet: the comment, *Edit comment*, *Resolve* (keep the text, drop the macro), *Delete comment and
+text*. The *Comment* button wraps the selection as `\pdmark` (refused across a paragraph break, a `\begin`/`\end`,
+a `%` comment or unbalanced braces, with the reason), or inserts `\pdnote` at the cursor; `{ } %` in comment
+text are escaped. *Save* commits through `POST /api/papers/<id>/file` with the blob sha the file was opened at; a
+409 offers *Reload theirs* / *Keep mine*. Unsaved text is kept in the app's files (`files/drafts/`) until saved or
+discarded, so it survives rotation, Back (which asks first) and the app being killed. Also: find in file (top
+bar), text size (⋮, persisted), line wrap, a symbol bar above the keyboard (`\ { } $ % & _ ^ ~ \cite{} \ref{}`).
 
 ## Setup wizard (`ui/Setup.kt`)
 A new user is handed only the APK. While no server is configured the app shows a wizard instead of the tabs; the
@@ -40,14 +68,19 @@ current step is kept in Prefs (`setup_step`) and Back walks backwards. The step 
 4. **Connect**: scan the installer's QR code (Google code scanner, no camera permission), or type machine
    address + pairing code, or paste a pairing link. The pairing is saved, confirmed with `/api/health`, and undone
    if that check fails.
-5. **reMarkable** (only if the server reports `features.rm_connect`): one-time code from
+5. **Keys** (servers with `/api/secrets`): one row per key with a write-only field; a stored key is never shown.
+6. **Chat agent** (`features.agent_setup`): LLM base URL + model (provider picker), `POST /api/agent-setup`,
+   job polled; afterwards the health's `agent_url` is saved and the Chat tab appears.
+7. **Papers** (`features.papers_edit`): add paper repos by git URL.
+8. **reMarkable** (only if the server reports `features.rm_connect`): one-time code from
    `my.remarkable.com/device/browser/connect` → `POST /api/rm/connect`, job polled until done.
-6. **What to follow** (only if `features.topics`): add topics; the first search starts when you leave the step.
-7. **Done**: enters the tabs, starts polling, asks for the notification permission.
+9. **What to follow** (only if `features.topics`): add topics; the first search starts when you leave the step.
+10. **Done**: enters the tabs, starts polling, asks for the notification permission.
 
 Until the wizard is finished the app is silent: no polling, no crash reports, no start-up ping.
 Settings (gear) has *Run setup again* (reopens step 4; the current desk stays until a new pairing works),
-*reMarkable: connect* (step 5 on its own, when available), *Paste pairing link* and *Disconnect*.
+*reMarkable: connect*, *Keys*, *Chat agent* and *Papers* (each one step on its own, when the server offers it),
+*Paste pairing link* and *Disconnect*.
 
 ### Pairing formats
 - **QR code / manual entry**: QR text `https://<host>[:port]/pair/<CODE>`; by hand a machine address
@@ -59,13 +92,15 @@ Settings (gear) has *Run setup again* (reopens step 4; the current desk stays un
   A link opened from outside the app always asks "Connect to …?" first, because any web page can open one.
 
 Prefs (`SharedPreferences "paperdesk"`): `url`, `token`, `agent_url`, `name`, `server_info` (last health JSON),
-`last_seq`, `setup_step`, `setup_solo`.
+`last_seq`, `setup_step`, `setup_solo`, `editor_font`.
 
 ## Feature gating
-`GET /api/health` → `features {remarkable, drafts, transfer, topics, agent, rm_connect}` and
-`targets [{id,label}]`. `remarkable=false` hides the reMarkable tab and every *Send to reMarkable*; `drafts=false`
+`GET /api/health` → `features {remarkable, drafts, transfer, topics, agent, rm_connect, papers_edit, latex,
+agent_setup}`, `targets [{id,label}]` and `agent_url`. `remarkable=false` hides the reMarkable tab and every *Send to reMarkable*; `drafts=false`
 hides the drafts section; `transfer=false` hides *Transfer marks into LaTeX*; no targets turns *Include in…* into
-a plain *Add to literature*; `agent=false` or no agent URL hides Chat; `topics` shows *Topics* in the inbox.
+a plain *Add to literature*; `agent=false` or no agent URL hides Chat; `topics` shows *Topics* in the inbox;
+`papers_edit` shows add/remove paper; `latex=false` hides *Build PDF*. A server without `/api/papers` (404) gets
+its reMarkable drafts listed as papers with only the reMarkable actions.
 A server that sends no `features` (older than 0.2) gets everything it always had, the classic P0–P3 targets, and
 no topics.
 
@@ -104,6 +139,7 @@ PaperDesk from battery optimisation makes it punctual.
 ## Code map
 `Models.kt` (API types, `ServerInfo`, `Topic`) · `Api.kt` (`Prefs`, `Pairing`, `PairClient`, HttpURLConnection +
 org.json clients) · `PollWorker.kt` (polling + notifications) · `ChatWatch.kt` ("Chat answered") ·
-`MainActivity.kt` (app frame: top bar, bottom bar, deep link, settings, update banner) · `ui/Bauhaus.kt` (theme,
-forms, flat components) · `ui/Setup.kt` (wizard) · `ui/PaperScreens.kt` (paper card, Inbox, Topics, Search) ·
-`ui/RemarkableScreens.kt` (reMarkable, Activity) · `ui/ChatScreen.kt` (agent chat).
+`MainActivity.kt` (app frame: top bar, bottom bar, deep link, settings, update banner, full-screen editor) ·
+`ui/Bauhaus.kt` (theme, forms, flat components) · `ui/Setup.kt` (wizard) · `ui/PaperScreens.kt` (paper card,
+Inbox, Topics, Search) · `ui/PaperTab.kt` (Paper tab, one paper, tablet) · `ui/Editor.kt` (editor screen + JS
+bridge) · `ui/RemarkableScreens.kt` (Activity) · `ui/ChatScreen.kt` (agent chat) · `editor/` (CodeMirror source).

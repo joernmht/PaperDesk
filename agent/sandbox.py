@@ -2,7 +2,7 @@
 
 Trust model
 - The agent's shell and file tools run ONLY inside container `pda-<thread>` (image pda-sandbox:1),
-  as uid 1000, all capabilities dropped, no secrets, CPU/RAM/PID limits. Its /workspace is a host
+  as uid 1000 (portable: the host user's uid), all capabilities dropped, no secrets, CPU/RAM/PID limits. Its /workspace is a host
   dir under /vol/scratch/agent-ws/<thread>/work, but the host never reads, writes or runs git in
   it after creating it (the agent could plant symlinks or git hooks/config there).
 - Repos enter the container as a git bundle made from a host-side "pristine" clone (never
@@ -26,8 +26,13 @@ from pathlib import Path
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
 
+# Box defaults; agentd.configure() adjusts them for a portable install (and for test instances).
 WS_ROOT = Path("/vol/scratch/agent-ws")
 IMAGE = "pda-sandbox:1"
+PREFIX = "pda"          # container names `<PREFIX>-<thread>` and label `<PREFIX>=1` (one namespace per agentd)
+SANDBOX_USER = "1000:1000"
+GIT_URL = "git@github.com:{repo}.git"   # box: SSH key; portable: https + GITHUB_TOKEN via a credential helper
+USER = "Joern"
 MAX_OUTPUT = 30_000
 DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 1200
@@ -36,7 +41,7 @@ IDLE_STOP_S = 1800
 LAYOUT = "3"  # 2 = /workspace (rw) + /workspace/ro; 3 = + live box checkouts bind-mounted read-only
 # Box checkouts that may be mounted read-only into a sandbox (GitHub remotes only; Overleaf repos carry
 # tokens in their URLs and never match). Scanned at depth 1.
-CHECKOUT_ROOTS = [Path.home(), Path("/vol/home")]
+CHECKOUT_ROOTS = [Path.home(), Path("/vol/home")]   # portable: [] unless agent.toml sets checkout_roots
 # Files inside a mounted checkout that are covered with an empty /dev/null (git-ignored secrets etc.).
 SECRET_GLOBS = [".env", "*.env", ".env.local", ".env.*.local", "secrets*", "*.pem", "*.key", "id_rsa*",
                 "id_ed25519*", ".netrc", "*.keystore", "*.jks", "*.p12", "local.properties", ".pin",
@@ -45,6 +50,31 @@ PRUNE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".dvc", ".
 _LOCAL: dict = {"t": 0.0, "map": {}}
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SAFE_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true"]
+# Portable: GitHub over https. The helper reads $GITHUB_TOKEN from agentd's environment at run time, so the
+# token is neither on a command line nor written into any .git/config (-c before the subcommand is not stored).
+HTTPS_CRED = ["-c", "credential.helper=", "-c",
+              "credential.helper=!f() { test \"$1\" = get && echo username=x-access-token && "
+              "echo \"password=$GITHUB_TOKEN\"; }; f"]
+
+
+def configure(*, ws_root: Path | None = None, prefix: str | None = None, sandbox_user: str | None = None,
+              https: bool = False, checkout_roots: list[Path] | None = None, user: str | None = None) -> None:
+    """Portable/test settings (the box keeps the defaults above)."""
+    global WS_ROOT, PREFIX, SANDBOX_USER, GIT_URL, SAFE_GIT, CHECKOUT_ROOTS, USER
+    if ws_root is not None:
+        WS_ROOT = Path(ws_root)
+    if prefix:
+        PREFIX = prefix
+    if sandbox_user:
+        SANDBOX_USER = sandbox_user
+    if https:
+        GIT_URL = "https://github.com/{repo}.git"
+        SAFE_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true", *HTTPS_CRED]
+    if checkout_roots is not None:
+        CHECKOUT_ROOTS = [Path(p) for p in checkout_roots]
+        _LOCAL.update(t=0.0, map={})
+    if user:
+        USER = user
 
 LAST_USE: dict[str, float] = {}
 _LOCK = threading.Lock()
@@ -55,7 +85,7 @@ def _run(cmd: list[str], *, input: bytes | None = None, timeout: int = 120) -> s
 
 
 def cname(tid: str) -> str:
-    return f"pda-{tid}"
+    return f"{PREFIX}-{tid}"
 
 
 def ws_dir(tid: str) -> Path:
@@ -132,8 +162,11 @@ def ensure_container(tid: str) -> str:
             work = ws_dir(tid) / "work"
             (work / ".home").mkdir(parents=True, exist_ok=True)
             (ws_dir(tid) / "ro").mkdir(parents=True, exist_ok=True)
-            r = _run(["docker", "run", "-d", "--name", name, "--label", "pda=1", "--label", f"pda.sig={sig}",
-                      "--user", "1000:1000",
+            if os.getuid() != int(SANDBOX_USER.split(":")[0]):  # host user != sandbox user: let it write
+                for d in (work, work / ".home"):
+                    d.chmod(0o777)
+            r = _run(["docker", "run", "-d", "--name", name, "--label", f"{PREFIX}=1", "--label", f"pda.sig={sig}",
+                      "--user", SANDBOX_USER,
                       "--memory", "2g", "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "512",
                       "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *mounts, IMAGE], timeout=60)
             if r.returncode:
@@ -150,17 +183,17 @@ def _label(name: str, key: str) -> str:
 
 
 def _make_room(tid: str) -> None:
-    r = _run(["docker", "ps", "--filter", "label=pda=1", "--format", "{{.Names}}"], timeout=20)
-    running = [n.removeprefix("pda-") for n in r.stdout.decode().split() if n != cname(tid)]
+    r = _run(["docker", "ps", "--filter", f"label={PREFIX}=1", "--format", "{{.Names}}"], timeout=20)
+    running = [n.removeprefix(PREFIX + "-") for n in r.stdout.decode().split() if n != cname(tid)]
     running.sort(key=lambda t: LAST_USE.get(t, 0))
     while len(running) >= MAX_RUNNING:
         _run(["docker", "stop", "-t", "3", cname(running.pop(0))], timeout=60)
 
 
 def reap_idle() -> None:
-    r = _run(["docker", "ps", "--filter", "label=pda=1", "--format", "{{.Names}}"], timeout=20)
+    r = _run(["docker", "ps", "--filter", f"label={PREFIX}=1", "--format", "{{.Names}}"], timeout=20)
     for n in r.stdout.decode().split():
-        tid = n.removeprefix("pda-")
+        tid = n.removeprefix(PREFIX + "-")
         if time.time() - LAST_USE.get(tid, 0) > IDLE_STOP_S:
             _run(["docker", "stop", "-t", "3", n], timeout=60)
 
@@ -270,7 +303,7 @@ def clone_into_sandbox(tid: str, repo: str, base_branch: str | None, identity: t
         args += ["--reference-if-able", box]
     if base_branch:
         args += ["--branch", base_branch]
-    r = _run([*args, f"git@github.com:{repo}.git", str(pristine)], timeout=600)
+    r = _run([*args, GIT_URL.format(repo=repo), str(pristine)], timeout=600)
     if r.returncode:
         raise RuntimeError(f"clone failed: {r.stderr.decode()[-300:]}")
     base = _host_git(pristine, "rev-parse", "--abbrev-ref", "HEAD").stdout.decode().strip()
@@ -323,7 +356,7 @@ def clone_readonly(tid: str, repo: str, ref: str | None) -> dict:
     args = [*SAFE_GIT, "clone", "-q", "--depth", "1", "--single-branch", "--no-tags"]
     if ref:
         args += ["--branch", ref]
-    r = _run([*args, f"git@github.com:{repo}.git", str(dest)], timeout=900)
+    r = _run([*args, GIT_URL.format(repo=repo), str(dest)], timeout=900)
     if r.returncode:
         shutil.rmtree(dest, ignore_errors=True)
         raise RuntimeError(f"clone failed: {r.stderr.decode()[-300:]}")
@@ -391,7 +424,7 @@ def export_commits(tid: str, name: str) -> dict:
     files = _host_git(pristine, "diff", "--name-only", info["base_sha"], info["branch"]).stdout.decode().split()
     blocked = [p for p in files if p.startswith(".github/")]
     if blocked:
-        raise RuntimeError(f"refused: changes under .github/ ({', '.join(blocked)}) need Joern by hand")
+        raise RuntimeError(f"refused: changes under .github/ ({', '.join(blocked)}) need {USER} by hand")
     stat = _host_git(pristine, "diff", "--shortstat", info["base_sha"], info["branch"]).stdout.decode().strip()
     log = _host_git(pristine, "log", "--format=%h %s", f"{info['base_sha']}..{info['branch']}").stdout.decode()
     return {**info, "files": files, "stat": stat, "commits": log.strip().splitlines()}

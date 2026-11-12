@@ -11,6 +11,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,7 +31,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Search
@@ -63,15 +64,18 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.joernmht.paperdesk.ui.ActivityScreen
 import com.joernmht.paperdesk.ui.BFilledButton
+import com.joernmht.paperdesk.ui.BBlue
+import androidx.compose.ui.graphics.Color
 import com.joernmht.paperdesk.ui.BOutlinedButton
 import com.joernmht.paperdesk.ui.ChatScreen
 import com.joernmht.paperdesk.ui.Form
 import com.joernmht.paperdesk.ui.FormKind
-import com.joernmht.paperdesk.ui.FormMark
 import com.joernmht.paperdesk.ui.InboxScreen
 import com.joernmht.paperdesk.ui.InkRule
 import com.joernmht.paperdesk.ui.PaperDeskTheme
-import com.joernmht.paperdesk.ui.RemarkableScreen
+import com.joernmht.paperdesk.ui.PaperTabScreen
+import com.joernmht.paperdesk.ui.EditorNav
+import com.joernmht.paperdesk.ui.EditorScreen
 import com.joernmht.paperdesk.ui.SearchScreen
 import com.joernmht.paperdesk.ui.SetupFlow
 import com.joernmht.paperdesk.ui.SetupWizard
@@ -131,7 +135,7 @@ class AppCtx(val ctx: Context, val api: Api, val agent: AgentApi, val snackbar: 
 enum class Tab(val key: String, val label: String, val icon: ImageVector) {
     Inbox("inbox", "Inbox", Icons.Filled.Inbox),
     Search("search", "Search", Icons.Filled.Search),
-    Remarkable("remarkable", "reMarkable", Icons.Filled.Edit),
+    Paper("paper", "Paper", Icons.Filled.Description),
     Chat("chat", "Chat", Icons.Filled.Forum),
     Activity("activity", "Activity", Icons.AutoMirrored.Filled.List),
 }
@@ -211,6 +215,8 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>, onPaired: () -> Un
             val h = app.api.health()
             Prefs.setServerInfo(ctx, h)
             info = ServerInfo.from(h)
+            // a desk whose agent was set up from the app announces its URL; take it unless one is set already
+            if (info.agentUrl.isNotBlank() && Prefs.agentUrl(ctx).isBlank()) Prefs.setAgentUrl(ctx, info.agentUrl)
             update = h.optInt("apk_version", 0) > BuildConfig.VERSION_CODE
         } catch (_: Exception) {
         }
@@ -218,13 +224,16 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>, onPaired: () -> Un
 
     val tabs = Tab.entries.filter {
         when (it) {
-            Tab.Remarkable -> info.remarkable
             Tab.Chat -> info.agent && Prefs.agentUrl(ctx).isNotBlank()
             else -> true
         }
     }
     val tab = tabState.value.takeIf { it in tabs } ?: Tab.Inbox
 
+    val editing by EditorNav.target
+
+    // The editor lies over the tabs (they stay composed, so Back lands on the same paper, scrolled as before).
+    Box(Modifier.fillMaxSize()) {
     Scaffold(
         topBar = { TopBar(if (inSetup) "Setup" else tab.label, if (inSetup) "" else info.name.ifBlank { Prefs.name(ctx) }) { showSettings = true } },
         bottomBar = { if (!inSetup) BottomBar(tabs, tab) { tabState.value = it } },
@@ -253,12 +262,19 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>, onPaired: () -> Un
                 when (tab) {
                     Tab.Inbox -> InboxScreen(app, settingsVersion)
                     Tab.Search -> SearchScreen(app)
-                    Tab.Remarkable -> RemarkableScreen(app, settingsVersion)
+                    Tab.Paper -> PaperTabScreen(app, settingsVersion)
                     Tab.Chat -> ChatScreen(app, settingsVersion)
                     Tab.Activity -> ActivityScreen(app, settingsVersion)
                 }
             }
         }
+    }
+
+    editing?.takeIf { !inSetup }?.let { t ->
+        Box(Modifier.fillMaxSize().clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}) {
+            EditorScreen(app, t) { EditorNav.target.value = null }
+        }
+    }
     }
 
     if (showSettings) SettingsDialog(info, onDismiss = { showSettings = false },
@@ -313,13 +329,11 @@ fun App(tabState: androidx.compose.runtime.MutableState<Tab>, onPaired: () -> Un
     }
 }
 
-/** Flat top bar: the mark, the name, the current place; a 2dp ink rule below. */
+/** Flat top bar: the name and the current place; a hairline below. */
 @Composable
 private fun TopBar(place: String, desk: String, onSettings: () -> Unit) {
     Column(Modifier.background(MaterialTheme.colorScheme.surface).windowInsetsPadding(WindowInsets.statusBars)) {
         Row(Modifier.fillMaxWidth().height(56.dp).padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            FormMark(14.dp)
-            Spacer(Modifier.width(12.dp))
             Text("PaperDesk", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Text(" · $place", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Normal, maxLines = 1,
                 overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
@@ -331,7 +345,7 @@ private fun TopBar(place: String, desk: String, onSettings: () -> Unit) {
     }
 }
 
-/** Flat bottom navigation: ink rule on top, the selected tab is a solid square block. */
+/** Flat bottom navigation: hairline on top, the selected tab is a solid blue block with a white icon. */
 @Composable
 private fun BottomBar(tabs: List<Tab>, current: Tab, onSelect: (Tab) -> Unit) {
     Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
@@ -342,10 +356,10 @@ private fun BottomBar(tabs: List<Tab>, current: Tab, onSelect: (Tab) -> Unit) {
                 Column(Modifier.weight(1f).fillMaxSize().clickable { onSelect(t) }, horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center) {
                     Box(Modifier.width(56.dp).height(32.dp)
-                        .background(if (sel) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.surface),
+                        .background(if (sel) BBlue else MaterialTheme.colorScheme.surface),
                         contentAlignment = Alignment.Center) {
                         Icon(t.icon, null, Modifier.size(22.dp),
-                            tint = if (sel) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.onSurface)
+                            tint = if (sel) Color.White else MaterialTheme.colorScheme.onSurface)
                     }
                     Text(t.label, style = MaterialTheme.typography.labelSmall, maxLines = 1,
                         fontWeight = if (sel) FontWeight.Bold else FontWeight.Medium, modifier = Modifier.padding(top = 4.dp))
@@ -390,6 +404,12 @@ fun SettingsDialog(info: ServerInfo, onDismiss: () -> Unit, onSetup: (step: Int,
                     onClick = { onSetup(SetupFlow.CONNECT, false) }) { Text("Run setup again") }
                 if (paired && info.rmConnect && !info.remarkable) BOutlinedButton(form = FormKind.Triangle, modifier = Modifier.padding(top = 8.dp),
                     onClick = { onSetup(SetupFlow.REMARKABLE, true) }) { Text("reMarkable: connect") }
+                if (paired && info.secrets) BOutlinedButton(form = FormKind.Triangle, modifier = Modifier.padding(top = 8.dp),
+                    onClick = { onSetup(SetupFlow.KEYS, true) }) { Text("Keys") }
+                if (paired && info.agentSetup) BOutlinedButton(form = FormKind.Triangle, modifier = Modifier.padding(top = 8.dp),
+                    onClick = { onSetup(SetupFlow.AGENT, true) }) { Text("Chat agent") }
+                if (paired && info.papersEdit) BOutlinedButton(form = FormKind.Triangle, modifier = Modifier.padding(top = 8.dp),
+                    onClick = { onSetup(SetupFlow.PAPERS, true) }) { Text("Papers") }
                 if (paired) BOutlinedButton(form = FormKind.Square, modifier = Modifier.padding(top = 8.dp),
                     onClick = { Prefs.disconnect(ctx); onSaved() }) { Text("Disconnect") }
                 Text("App ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})." +

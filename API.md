@@ -57,3 +57,18 @@ Event = { seq: int, ts: str, kind: str, title: str, body: str, ref: str|null }
       `<its folder>/Older`), `"delete"` (`path`; moves to the tablet's trash).
 - `GET  /files/annotated/<name>` → `application/pdf`
 - `GET  /download/paperdesk.apk` (no token needed; tailnet only) — the newest APK
+
+## Papers, keys, chat agent (0.2)
+- `GET /api/papers` → `{papers: [{id, label, main, branch, head: {hash, date, subject}, comments: int, rm: bool, error}]}`
+- `POST /api/papers` (portable only) `{op: "add", label, git_url, main?}` | `{op: "remove", id}` → `{papers, job}`
+- `GET /api/papers/<id>/files` → `{files: [{path, size}]}` (text files only)
+- `GET /api/papers/<id>/file?path=` → `{path, text, sha, head}` (sha = git blob sha of the text)
+- `POST /api/papers/<id>/file` `{path, text, base_sha, message?}` → `{sha, commit, pushed, note}` or
+  409 `{error: "changed", text, sha}` (the file changed since `base_sha`; resend with the new sha to keep yours)
+- `GET /api/papers/<id>/comments` → `{comments: [{id, kind: mark|note|rmnote|rmhl|rmdel, path, line, col, marked, comment}]}`
+- `POST /api/papers/<id>/build` → `{job}`; `GET /api/papers/<id>/pdf` → `application/pdf`; `POST /api/papers/<id>/sync` → `{head}`
+- `GET /api/secrets` → `{secrets: [{name, label, help, url, optional, set}]}` (never values);
+  `POST /api/secrets {name, value}` → same list (portable only)
+- `GET /api/agent-setup` → `{base_url, model, configured, providers: [...], running}`;
+  `POST /api/agent-setup {base_url, model}` → `{job}` (writes `~/.config/paperdesk/agent.toml`; the agent re-reads it)
+- health `features` adds `papers`, `papers_edit`, `latex`, `secrets`, `agent_setup`.

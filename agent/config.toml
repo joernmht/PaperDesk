@@ -30,8 +30,13 @@ context_budget = 200000
 default = "auto"
 
 [github]
+# box only: this file is read when ~/.config/paperdesk/config.toml says profile = "box". A portable
+# install takes the model from ~/.config/paperdesk/agent.toml and the GitHub identity from its token.
 # writes (comment, issue, writable clone + PR) only for these owners
 write_owners = ["joernmht"]
+default_owner = "joernmht"
+user = "Joern"   # how tool messages name the person
+he = "he"
 # repos the agent must not read or touch (empty: EBL is fine on EU-hosted models, Joern 2026-11-09)
 deny = []
 author_name = "Joern Maurischat"

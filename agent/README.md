@@ -2,7 +2,40 @@
 
 A LangChain [DeepAgent](https://github.com/langchain-ai/deepagents) chat service for the PaperDesk app.
 
-- `agentd.py`: FastAPI on `127.0.0.1:8800`, published tailnet-only as `https://paper1.tailbf37ab.ts.net:8448`
+## Two profiles
+The profile comes from `~/.config/paperdesk/config.toml` (`profile = "box"` or, by default, portable), like the server.
+
+**Portable** (any machine set up by `install.sh`):
+- Install: `agent/install_agent.sh` (idempotent, no sudo; needs python3-venv, docker with the user in the
+  `docker` group, `gh`): venv `~/.local/share/paperdesk/agent-venv` from the pinned `requirements.txt`, sandbox
+  image `pda-sandbox:1` from `sandbox/Dockerfile` (rebuilt only when the Dockerfile changes).
+- Run: systemd `paperdesk-agent` → `<venv>/bin/python -I agent/agentd.py serve --port 8800`, published with
+  `tailscale serve --https=8448`. Bearer token = the PaperDesk token (`~/.config/paperdesk/token`).
+- It starts **unconfigured** (`health.configured = false`, chat endpoints 503) until the app has written
+  `~/.config/paperdesk/agent.toml` and the keys in `~/.config/paperdesk/secrets.env`. Both are re-read when
+  their mtime changes, on every request: no restart; cached agents and the repo list are dropped.
+  ```toml
+  # agent.toml
+  base_url = "https://api.mistral.ai/v1"   # any OpenAI-compatible /v1 endpoint
+  model = "mistral-large-latest"
+  models = ["mistral-small-latest"]        # optional extra choices in the app
+  temperature = 0.3                        # optional
+  eu_only = true                           # optional: refuse hosts outside the EU allowlist
+  checkout_roots = []                      # optional: dirs whose git checkouts may be mounted read-only
+  ```
+  `secrets.env`: `LLM_API_KEY=...` (the model key), `GITHUB_TOKEN=...` (GitHub tools, clones over https and PRs;
+  the agent acts as that token's account: default owner and the only write owner, commit identity from
+  `gh api user`). The token reaches git only through a credential helper reading the environment; it is never
+  on a command line or in a `.git/config`.
+- Provider presets (`health.providers`): Mistral AI (EU), ScaDS.AI LLM service (EU, Saxon universities),
+  OpenRouter EU routing (EU, needs a Business plan), Other (OpenAI-compatible).
+- Env overrides (tests, second instances): `PAPERDESK_CONFIG_DIR`, `PAPERDESK_STATE_DIR`, `PAPERDESK_AGENT_WS`
+  (sandbox workspaces, default `<state>/agent-ws`), `PAPERDESK_AGENT_PREFIX` (container names + label, default `pda`).
+- Tests (offline, no LLM/docker): `<venv>/bin/python -m unittest discover -s agent/tests -v`.
+
+**Box** (Joern's research box): everything below. `agent/config.toml` (box only) holds the model and GitHub
+policy; the box's `gh` login and SSH key; box checkouts mounted read-only.
+- `agentd.py`: FastAPI on `127.0.0.1:8800`, published tailnet-only as `https://<box>.<tailnet>.ts.net:8448`
   (mapping + keepalive in `~/.claude/loops/review_server_start.sh`). Same bearer token as the PaperDesk server.
 - `config.toml`: model endpoint (OpenAI-compatible). **EU-hosted LLMs only** (Joern 2026-11-09): `agentd.py`
   refuses to start unless the endpoint host is on its in-code `EU_ENDPOINTS` allowlist and `region = "EU"`.
@@ -38,7 +71,8 @@ A LangChain [DeepAgent](https://github.com/langchain-ai/deepagents) chat service
 ## API (all but health need `Authorization: Bearer <token>`)
 - `GET  /api/agent/health` → `{ok, version, model, models, limits: {model: {max_input_tokens, max_output_tokens,
   effective_input_tokens, summarize_at}}, context_budget, summarize_fraction, hosting, region, approvals_default,
-  running, ping_s, features}`. Context: deepagents summarises old messages at 85 % of
+  running, ping_s, features, profile: "box"|"portable", configured: bool, problems: [str], base_url,
+  github: bool, github_login, providers: [{id, label, base_url, model, url, eu: bool, note}]}` (no auth). Context: deepagents summarises old messages at 85 % of
   `min(window, context_budget)` and keeps the newest 10 % (`[model.limits]` + `context_budget` in config.toml).
 - `GET  /api/agent/threads` → `{threads: [thread + last_seq]}`. A thread is `{id, title, created, updated, model,
   repos, approvals: auto|ask, subagents: bool, origin: str|null, running: bool}`.

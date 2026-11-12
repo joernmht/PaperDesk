@@ -85,8 +85,8 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
     }
 
     val info = app.info
-    BCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).animateContentSize()) {
-        Column(Modifier.padding(12.dp)) {
+    Column(Modifier.fillMaxWidth().animateContentSize()) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
             Row(verticalAlignment = Alignment.Top) {
                 // the form says where this paper stands: ■ new, ▲ on its way, ● kept
                 Form(statusForm(if (p.inCorpus && p.status == "new") "added" else p.status), 14.dp,
@@ -149,6 +149,7 @@ fun PaperCard(app: AppCtx, p: Paper, onUpdated: (Paper) -> Unit) {
                 }
             }
         }
+        Hairline(Modifier.padding(start = 16.dp))
     }
 
     if (pickTarget) AlertDialog(

@@ -43,6 +43,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import papers as pp
 import pdlib
 
 VERSION = "0.2"
@@ -105,10 +106,29 @@ def rm_available() -> bool:
     return rmp.available()
 
 
+AGENT_LOCAL = "http://127.0.0.1:8800"
+_AGENT_HEALTH: dict = {"t": 0.0, "h": None}
+
+
+def agent_health(fresh: bool = False) -> dict | None:
+    """The local chat agent's health (cached 60 s); None when it does not answer."""
+    if fresh or time.time() - _AGENT_HEALTH["t"] > 60:
+        r = pdlib.get(AGENT_LOCAL + "/api/agent/health", timeout=5) if CFG.get("agent_url") else None
+        try:
+            _AGENT_HEALTH.update(t=time.time(), h=r.json() if r is not None and r.status_code == 200 else None)
+        except ValueError:
+            _AGENT_HEALTH.update(t=time.time(), h=None)
+    return _AGENT_HEALTH["h"]
+
+
 def features() -> dict:
     rm = rm_available()
+    ah = agent_health() if not BOX else None
     return {"remarkable": rm, "drafts": BOX and rm, "transfer": BOX and rm,
-            "topics": bool(CFG["watch"].get("enabled", True)), "agent": bool(CFG.get("agent_url")),
+            "topics": bool(CFG["watch"].get("enabled", True)),
+            "agent": bool(CFG.get("agent_url")) and (BOX or bool(ah and ah.get("configured"))),
+            "agent_setup": not BOX and bool(CFG.get("agent_url")),
+            "papers": True, "papers_edit": not BOX, "latex": bool(pp.latexmk()), "secrets": not BOX,
             "rm_connect": not BOX and str(CFG["remarkable"].get("enabled", "auto")).lower() not in ("false", "no", "off", "0")}
 
 
@@ -829,7 +849,40 @@ def k_rm_connect(spec: dict, log: Path) -> str:
     return "reMarkable connected"
 
 
-JOB_KINDS = {"rm_connect": k_rm_connect, "watch": k_watch, "literature": k_literature, "remarkable": k_remarkable, "rm_draft": k_rm_draft,
+def k_paper_build(spec: dict, log: Path) -> str:
+    p = paper(spec["paper"])
+    with log.open("a") as f:
+        return pp.build(p, f)
+
+
+def k_paper_add(spec: dict, log: Path) -> str:
+    p = paper(spec["paper"])
+    try:
+        d = pp.ensure_clone(p)
+    except Exception:
+        pp.remove(p["id"])
+        raise
+    main = pp.main_file(d, p)
+    return f"{p['label']}: cloned ({len(pp.files(p))} files, main {main or 'not found'})"
+
+
+def k_agent_setup(spec: dict, log: Path) -> str:
+    """Write ~/.config/paperdesk/agent.toml; the agent re-reads it. Wait until it reports configured."""
+    f = pdlib.CONFIG_DIR / "agent.toml"
+    f.write_text(f'base_url = {json.dumps(spec["base_url"])}\nmodel = {json.dumps(spec["model"])}\n')
+    for _ in range(30):
+        h = agent_health(fresh=True)
+        if h and h.get("configured"):
+            return f"chat agent ready ({spec['model']})"
+        time.sleep(2)
+    h = agent_health(fresh=True)
+    if h is None:
+        raise RuntimeError("the chat agent service does not answer (sudo systemctl status paperdesk-agent)")
+    raise RuntimeError("; ".join(h.get("problems") or []) or "not configured: is the LLM API key set under Keys?")
+
+
+JOB_KINDS = {"paper_build": k_paper_build, "paper_add": k_paper_add, "agent_setup": k_agent_setup,
+             "rm_connect": k_rm_connect, "watch": k_watch, "literature": k_literature, "remarkable": k_remarkable, "rm_draft": k_rm_draft,
              "rm_draftpull": k_rm_draftpull, "rm_pull": k_rm_pull, "rm_transfer": k_rm_transfer,
              "rm_archive": k_rm_archive, "rm_delete": k_rm_delete}
 
@@ -986,6 +1039,116 @@ def apk_version() -> int:
         return 0
 
 
+def paper(pid: str) -> dict:
+    p = pp.registry(CFG, BOX).get(pid)
+    if not p:
+        raise KeyError(f"unknown paper {pid}")
+    return p
+
+
+def papers_get(rest: str, q: dict):
+    """GET /api/papers[/<id>/files|file|comments]; returns (code, obj) or (code, bytes, ctype) for the PDF."""
+    if not rest:
+        return 200, {"papers": pp.list_papers(CFG, BOX)}
+    pid, _, what = rest.partition("/")
+    p = paper(pid)
+    if what == "files":
+        return 200, {"files": pp.files(p)}
+    if what == "file":
+        return 200, pp.read(p, q.get("path", ""))
+    if what == "comments":
+        d = pp.sync(p)
+        return 200, {"comments": [{k: c[k] for k in ("id", "kind", "path", "line", "col", "marked", "comment")}
+                                  for c in pp.comments(d)]}
+    if what == "pdf":
+        f = pp.pdf_path(p)
+        if not f:
+            return 404, {"error": "no PDF yet: build it first"}
+        return 200, f.read_bytes(), "application/pdf"
+    raise KeyError("not found")
+
+
+def papers_post(rest: str, body: dict) -> tuple[int, dict]:
+    if not rest:
+        op = body.get("op")
+        if BOX:
+            raise ValueError("papers on this desk are set in config.toml")
+        if op == "add":
+            p = pp.add(str(body.get("label") or ""), str(body.get("git_url") or ""), str(body.get("main") or ""))
+            job = new_job("paper_add", f"Add paper: {p['label']}", {"paper": p["id"]})
+            return 200, {"papers": pp.list_papers(CFG, BOX), "job": job}
+        if op == "remove":
+            pp.remove(str(body.get("id")))
+            return 200, {"papers": pp.list_papers(CFG, BOX), "job": None}
+        raise ValueError(f"unknown op {op}")
+    pid, _, what = rest.partition("/")
+    p = paper(pid)
+    if what == "file":
+        try:
+            return 200, pp.write(p, str(body.get("path") or ""), str(body.get("text") or ""),
+                                 str(body.get("base_sha") or ""), body.get("message"))
+        except pp.Conflict as c:
+            return 409, {"error": "changed", "text": c.text, "sha": c.sha}
+    if what == "build":
+        return 200, {"job": new_job("paper_build", f"Build PDF: {p['label']}", {"paper": pid})}
+    if what == "sync":
+        return 200, {"head": pp.head(pp.sync(p, force=True))}
+    raise KeyError("not found")
+
+
+SECRETS = [
+    {"name": "LLM_API_KEY", "label": "LLM API key (chat agent)", "optional": True, "url": None,
+     "help": "The key of the model provider you pick in the Chat agent step."},
+    {"name": "GITHUB_TOKEN", "label": "GitHub token", "optional": True,
+     "url": "https://github.com/settings/personal-access-tokens/new",
+     "help": "Fine-grained token: your repos, Contents + Pull requests + Issues read/write. For GitHub paper repos and the chat agent."},
+    {"name": "OVERLEAF_TOKEN", "label": "Overleaf git token", "optional": True,
+     "url": "https://www.overleaf.com/user/settings",
+     "help": "Account settings > Git integration (also on institutional Overleaf servers). For editing Overleaf papers."},
+    {"name": "OPENALEX_MAILTO", "label": "Your e-mail for OpenAlex", "optional": True, "url": None,
+     "help": "Optional: OpenAlex answers faster for clients that say who they are."},
+    {"name": "ELSEVIER_API_KEY", "label": "Elsevier / Scopus API key", "optional": True,
+     "url": "https://dev.elsevier.com/apikey/manage", "help": "Optional: adds Scopus to Search."},
+]
+SECRET_NAMES = {x["name"] for x in SECRETS}
+
+
+def secrets_list() -> dict:
+    return {"secrets": [dict(x, set=bool(os.environ.get(x["name"]))) for x in SECRETS]}
+
+
+def secret_set(name: str, value: str) -> dict:
+    if BOX:
+        raise ValueError("keys on this desk are managed over SSH")
+    if name not in SECRET_NAMES:
+        raise ValueError("unknown key")
+    value = value.strip()
+    if not value or "\n" in value or len(value) > 500:
+        raise ValueError("empty or invalid value")
+    f = pdlib.CONFIG_DIR / "secrets.env"
+    lines = [l for l in (f.read_text().splitlines() if f.exists() else []) if not l.startswith(name + "=")]
+    lines.append(f"{name}={value}")
+    tmp = f.with_suffix(".tmp")
+    tmp.touch(mode=0o600)
+    os.chmod(tmp, 0o600)
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(f)
+    os.environ[name] = value
+    return secrets_list()
+
+
+def agent_setup_get() -> dict:
+    h = agent_health(fresh=True) or {}
+    cur = {}
+    f = pdlib.CONFIG_DIR / "agent.toml"
+    if f.exists():
+        import tomllib
+        cur = tomllib.loads(f.read_text())
+    return {"base_url": cur.get("base_url", ""), "model": cur.get("model", ""),
+            "configured": bool(h.get("configured")), "providers": h.get("providers", []),
+            "running": bool(h)}
+
+
 def public_url(host_header: str = "") -> str:
     if CFG.get("public_url"):
         return str(CFG["public_url"]).rstrip("/")
@@ -1088,9 +1251,19 @@ class H(BaseHTTPRequestHandler):
                 if p == "/api/health":
                     return self._send(200, {"ok": True, "version": VERSION, "apk_version": apk_version(),
                                             "name": CFG["name"], "profile": CFG["profile"], "features": features(),
+                                            "agent_url": str(CFG.get("agent_url") or ""),
                                             "targets": [{"id": k, "label": v[0]} for k, v in PAPERS.items()]})
                 if p == "/api/topics":
                     return self._send(200, {"topics": pdlib.topics_load()})
+                if p == "/api/papers" or p.startswith("/api/papers/"):
+                    r = papers_get(p[len("/api/papers/"):] if p != "/api/papers" else "", q)
+                    if len(r) == 3:
+                        return self._send(r[0], body=r[1], ctype=r[2])
+                    return self._send(r[0], r[1])
+                if p == "/api/secrets":
+                    return self._send(200, secrets_list())
+                if p == "/api/agent-setup":
+                    return self._send(200, agent_setup_get())
                 if p == "/api/inbox":
                     return self._send(200, {"items": inbox(q.get("status", "open"))})
                 if p == "/api/search":
@@ -1130,6 +1303,20 @@ class H(BaseHTTPRequestHandler):
                     return self._send(200, rm_action(self._body()))
                 if p == "/api/topics":
                     return self._send(200, topics_action(self._body()))
+                if p == "/api/papers" or p.startswith("/api/papers/"):
+                    return self._send(*papers_post(p[len("/api/papers/"):] if p != "/api/papers" else "", self._body()))
+                if p == "/api/secrets":
+                    b = self._body()
+                    return self._send(200, secret_set(str(b.get("name") or ""), str(b.get("value") or "")))
+                if p == "/api/agent-setup":
+                    if BOX:
+                        raise ValueError("the chat agent on this desk is configured on the box")
+                    b = self._body()
+                    base, model = str(b.get("base_url") or "").strip(), str(b.get("model") or "").strip()
+                    if not base.startswith("https://") or not model:
+                        raise ValueError("an https base URL and a model name are needed")
+                    return self._send(200, {"job": new_job("agent_setup", f"Chat agent: {model}",
+                                                           {"base_url": base, "model": model})})
                 if p == "/api/rm/connect":
                     if not features()["rm_connect"]:
                         raise ValueError("reMarkable is switched off in config.toml")

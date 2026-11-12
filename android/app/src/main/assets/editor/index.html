@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>PaperDesk editor</title>
+<style>
+  :root {
+    --ink: #141414; --paper: #F5F1E8; --muted: #6B675E; --blue: #0047BB; --red: #C8001F; --olive: #7A5C00;
+    --yellow: #FFCC00; --yellow-soft: #FFE680; --sel: rgba(0, 71, 187, .22); --active: rgba(20, 20, 20, .04);
+  }
+  body.dark {
+    --ink: #F5F1E8; --paper: #141414; --muted: #9C978C; --blue: #4D86FF; --red: #FF4D5E; --olive: #FFCC00;
+    --yellow-soft: rgba(255, 204, 0, .30); --sel: rgba(77, 134, 255, .35); --active: rgba(245, 241, 232, .05);
+  }
+  html, body { margin: 0; height: 100%; background: var(--paper); color: var(--ink); }
+  #ed { height: 100%; }
+  /* \pdmark: only the marked text, yellow ground + blue underline */
+  .pd-mark { background: var(--yellow-soft); border-bottom: 2px solid var(--blue); }
+  body.dark .pd-mark { color: var(--ink); }
+  /* \rmhl / \rmdel from the reMarkable */
+  .pd-hl { background: var(--yellow-soft); }
+  .pd-del { text-decoration: line-through; text-decoration-color: var(--red); text-decoration-thickness: 2px; color: var(--muted); }
+  /* point comments as forms: blue circle = \pdnote, red square = \rmnote, yellow triangle = empty mark */
+  .pd-w { display: inline-block; width: .8em; height: .8em; margin: 0 .25em; vertical-align: -.05em; cursor: pointer;
+          padding: .35em; background-clip: content-box; box-sizing: content-box; }
+  .pd-circle { background-color: var(--blue); border-radius: 50%; }
+  .pd-square { background-color: var(--red); }
+  .pd-tri { background-color: var(--yellow); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+</style>
+</head>
+<body>
+<div id="ed"></div>
+<script src="editor.js"></script>
+</body>
+</html>

@@ -1,10 +1,15 @@
 """PaperDesk agent: a LangChain DeepAgent chat service for the PaperDesk Android app.
 
-Runs on 127.0.0.1:8800 (published on the tailnet as https://paper1.<tailnet>.ts.net:8448 by
-~/.claude/loops/review_server_start.sh). Same bearer token as the PaperDesk server
-(~/.config/paperdesk/token). Conversations persist in a LangGraph SQLite checkpointer.
+Runs on 127.0.0.1:8800 (published on the tailnet as https://<machine>.<tailnet>.ts.net:8448 by
+`tailscale serve`). Same bearer token as the PaperDesk server (~/.config/paperdesk/token).
+Conversations persist in a LangGraph SQLite checkpointer.
 
-Model: any OpenAI-compatible endpoint, configured in agent/config.toml (default: ScaDS.AI).
+Two profiles, like the server (~/.config/paperdesk/config.toml `profile`):
+- "box" (Joern's research box): model + GitHub policy from agent/config.toml, EU-only allowlist enforced at
+  start, the box's `gh` login and SSH key, box checkouts mounted read-only into sandboxes.
+- "portable" (default): model from ~/.config/paperdesk/agent.toml, keys from ~/.config/paperdesk/secrets.env
+  (LLM_API_KEY, GITHUB_TOKEN), both re-read when they change (no restart). Starts unconfigured: health says
+  configured=false and chat endpoints answer 503 until the app has set a provider and the key.
 Tools: DeepAgent built-ins (todos, files, shell, sub-agents) running inside a per-chat Docker
 sandbox (see sandbox.py), GitHub read tools, and approval-gated writes (comment, issue, PR).
 The agent never touches the box's own filesystem or shell.
@@ -41,16 +46,23 @@ import sandbox  # noqa: E402
 
 HOME = Path.home()
 DIR = Path(__file__).resolve().parent
-STATE = HOME / ".local/state/paperdesk"
+CONFIG_DIR = Path(os.environ.get("PAPERDESK_CONFIG_DIR") or HOME / ".config/paperdesk")
+STATE = Path(os.environ.get("PAPERDESK_STATE_DIR") or HOME / ".local/state/paperdesk")
 DB_PATH = STATE / "agent.sqlite"
-TOKEN_FILE = HOME / ".config/paperdesk/token"
-VERSION = "0.5.0"
+TOKEN_FILE = CONFIG_DIR / "token"
+AGENT_TOML = CONFIG_DIR / "agent.toml"
+SECRETS_ENV = CONFIG_DIR / "secrets.env"
+VERSION = "0.6.0"
 
-CONFIG = tomllib.loads((DIR / "config.toml").read_text())
-POLICY = ghtools.Policy(CONFIG.get("github", {}))
-APPROVALS_DEFAULT = CONFIG.get("approvals", {}).get("default", "auto")
-LIMITS = CONFIG["model"].get("limits", {})  # per model: max_input_tokens, max_output_tokens
-CONTEXT_BUDGET = int(CONFIG["model"].get("context_budget", 200_000))
+
+def _profile() -> str:
+    try:
+        return str(tomllib.loads((CONFIG_DIR / "config.toml").read_text()).get("profile", "portable"))
+    except (OSError, ValueError):
+        return "portable"
+
+
+BOX = _profile() == "box"
 SUMMARIZE_AT = 0.85  # deepagents summarises at this fraction of a model's (profile) window
 PING_S = 15  # a tail sends {"type":"ping"} after this many silent seconds
 TERMINAL = ("done", "error")  # every run ends with exactly one of these
@@ -70,15 +82,197 @@ EU_ENDPOINTS = {
 }
 
 
-def _check_eu(m: dict) -> str:
+# Portable installs with `eu_only = true` in agent.toml accept these too (the box list above stays as it is).
+EU_ENDPOINTS_PORTABLE = {**EU_ENDPOINTS, "api.mistral.ai": "Mistral AI (France)"}
+
+# Provider presets for the app's "Chat agent" setup step (GET /api/agent/health -> providers).
+PROVIDERS = [
+    {"id": "mistral", "label": "Mistral AI", "base_url": "https://api.mistral.ai/v1",
+     "model": "mistral-large-latest", "url": "https://console.mistral.ai/api-keys", "eu": True,
+     "note": "Hosted in the EU (France). Pay per use."},
+    {"id": "scads", "label": "ScaDS.AI LLM service", "base_url": "https://llm.scads.ai/v1",
+     "model": "deepseek-ai/DeepSeek-V4.1-Flash", "url": "https://llm.scads.ai/", "eu": True,
+     "note": "TU Dresden / Leipzig University (Germany). For members of Saxon universities; daily request cap."},
+    {"id": "openrouter-eu", "label": "OpenRouter EU routing", "base_url": "https://eu.openrouter.ai/api/v1",
+     "model": "mistralai/mistral-large", "url": "https://openrouter.ai/settings/keys", "eu": True,
+     "note": "European providers only. Needs an OpenRouter Business plan (plain keys get 403)."},
+    {"id": "other", "label": "Other (OpenAI-compatible)", "base_url": "", "model": "", "url": None, "eu": False,
+     "note": "Any OpenAI-compatible /v1 endpoint, e.g. a self-hosted vLLM or Ollama."},
+]
+
+
+def _host(url: str) -> str:
     from urllib.parse import urlparse
-    host = (urlparse(m["base_url"]).hostname or "").lower()
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def _check_eu(m: dict) -> str:
+    host = _host(m["base_url"])
     if m.get("region") != "EU" or host not in EU_ENDPOINTS:
         raise SystemExit(f"refusing to start: model endpoint {host!r} is not on the EU-hosted allowlist")
     return EU_ENDPOINTS[host]
 
 
-HOSTING = _check_eu(CONFIG["model"])
+# ---------------------------------------------------------------- configuration (box: static; portable: live)
+CFG_LOCK = threading.RLock()
+CONFIG: dict = {}
+POLICY: ghtools.Policy
+APPROVALS_DEFAULT = "auto"
+LIMITS: dict = {}  # per model: max_input_tokens, max_output_tokens
+CONTEXT_BUDGET = 200_000
+HOSTING: str | None = None
+PROBLEMS: list[str] = []  # portable: why the agent is not usable yet (empty = configured)
+_SIG: tuple | None = None
+_IDENT: dict[str, dict] = {}  # sha256(token) -> GitHub identity
+
+
+def _read_env(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:]
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _gh_identity(token: str) -> dict:
+    """{login, name, email, id} of a GitHub token (cached per token; {} when GitHub cannot be asked)."""
+    import hashlib
+    import subprocess
+    key = hashlib.sha256(token.encode()).hexdigest()
+    if key not in _IDENT:
+        try:
+            r = subprocess.run(["gh", "api", "user"], capture_output=True, timeout=30,
+                               env={**os.environ, "GH_TOKEN": token})
+            u = json.loads(r.stdout) if r.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            u = {}
+        if not u.get("login"):
+            return {}
+        _IDENT[key] = {k: u.get(k) for k in ("login", "name", "email", "id")}
+    return _IDENT[key]
+
+
+def _apply(cfg: dict, hosting: str | None, problems: list[str]) -> None:
+    global CONFIG, POLICY, APPROVALS_DEFAULT, LIMITS, CONTEXT_BUDGET, HOSTING, PROBLEMS
+    CONFIG = cfg
+    POLICY = ghtools.Policy(cfg.get("github", {}))
+    APPROVALS_DEFAULT = cfg.get("approvals", {}).get("default", "auto")
+    LIMITS = cfg["model"].get("limits", {})
+    CONTEXT_BUDGET = int(cfg["model"].get("context_budget", 200_000))
+    HOSTING, PROBLEMS = hosting, problems
+
+
+def load_portable() -> tuple[dict, str | None, list[str]]:
+    """agent.toml + secrets.env -> (config in the box's shape, hosting label, problems)."""
+    try:
+        a = tomllib.loads(AGENT_TOML.read_text(encoding="utf-8")) if AGENT_TOML.exists() else {}
+    except (OSError, ValueError) as e:
+        a = {}
+        bad = f"agent.toml unreadable ({e})"
+    else:
+        bad = None
+    sec = _read_env(SECRETS_ENV)
+    key, gh = sec.get("LLM_API_KEY", ""), sec.get("GITHUB_TOKEN", "")
+    for name, val in (("LLM_API_KEY", key), ("GITHUB_TOKEN", gh), ("GH_TOKEN", gh)):
+        if val:
+            os.environ[name] = val
+        else:
+            os.environ.pop(name, None)
+    model, base = str(a.get("model") or ""), str(a.get("base_url") or "").rstrip("/")
+    models = [str(x) for x in a.get("models") or []]
+    if model and model not in models:
+        models.insert(0, model)
+    problems = [bad] if bad else []
+    if not (model and base):
+        problems.append("no LLM provider chosen")
+    if not key:
+        problems.append("no LLM_API_KEY saved")
+    hosting = None
+    if base:
+        hosting = next((p["label"] for p in PROVIDERS if p["base_url"] and _host(p["base_url"]) == _host(base)),
+                       _host(base))
+        if a.get("eu_only"):
+            if _host(base) in EU_ENDPOINTS_PORTABLE:
+                hosting = EU_ENDPOINTS_PORTABLE[_host(base)]
+            else:
+                problems.append(f"eu_only is set but {_host(base)!r} is not on the EU-hosted allowlist")
+    ident = _gh_identity(gh) if gh else {}
+    login = ident.get("login") or ""
+    email = ident.get("email") or (f"{ident['id']}+{login}@users.noreply.github.com" if ident.get("id")
+                                   else f"{login}@users.noreply.github.com" if login else "")
+    cfg = {
+        "model": {"name": model or None, "base_url": base, "api_key_env": "LLM_API_KEY",
+                  "region": "EU" if a.get("eu_only") else None,
+                  "temperature": float(a.get("temperature", 0.3)), "timeout": int(a.get("timeout", 120)),
+                  "choices": models, "limits": dict(a.get("limits") or {}),
+                  "context_budget": int(a.get("context_budget", 200_000))},
+        "approvals": {"default": a.get("approvals", "auto") if a.get("approvals") in ("auto", "ask") else "auto"},
+        "github": {"write_owners": [login] if login else [], "default_owner": login,
+                   "deny": [str(x) for x in a.get("deny") or []],
+                   "author_name": ident.get("name") or login or "PaperDesk agent", "author_email": email,
+                   "user": "the user", "he": "they"},
+        "login": login, "github_token": bool(gh), "eu_only": bool(a.get("eu_only")),
+        "checkout_roots": [str(x) for x in a.get("checkout_roots") or []],
+    }
+    return cfg, hosting, problems
+
+
+def _config_sig() -> tuple:
+    def mt(p: Path):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    return (mt(AGENT_TOML), mt(SECRETS_ENV))
+
+
+def refresh() -> None:
+    """Portable: re-read agent.toml / secrets.env when either changed; drop cached agents and repo lists."""
+    global _SIG
+    if BOX:
+        return
+    sig = _config_sig()
+    if sig == _SIG:
+        return
+    with CFG_LOCK:
+        if sig == _SIG:
+            return
+        cfg, hosting, problems = load_portable()
+        _apply(cfg, hosting, problems)
+        sandbox.configure(checkout_roots=[Path(p) for p in cfg["checkout_roots"]])
+        _SIG = sig
+    with DB_LOCK:
+        AGENTS.clear()
+    _REPO_CACHE["t"] = 0.0
+
+
+def configured() -> bool:
+    refresh()
+    return not PROBLEMS
+
+
+def require_configured() -> None:
+    if not configured():
+        raise HTTPException(503, "The chat agent is not set up yet (" + "; ".join(PROBLEMS) + "). Pick a "
+                            "provider and save the LLM_API_KEY in the PaperDesk app: Settings > Chat agent.")
+
+
+if BOX:
+    _cfg = tomllib.loads((DIR / "config.toml").read_text())
+    _apply(_cfg, _check_eu(_cfg["model"]), [])
+else:
+    _uid = os.getuid()
+    sandbox.configure(ws_root=Path(os.environ.get("PAPERDESK_AGENT_WS") or STATE / "agent-ws"),
+                      prefix=os.environ.get("PAPERDESK_AGENT_PREFIX") or "pda", https=True, user="the user",
+                      sandbox_user=f"{_uid}:{os.getgid()}" if _uid else "1000:1000", checkout_roots=[])
 
 SYSTEM_PROMPT = """You are Joern's research and coding assistant inside his PaperDesk phone app.
 Joern is a PhD researcher at TU Dresden (Chair of Railway Operations) working on LLMs and
@@ -116,6 +310,43 @@ Be efficient: set up and run the tests early, use one targeted grep instead of m
 exploring once you know enough. Batch related shell commands into one execute call.
 Never edit .github/ (CI) files; they are refused. Comments and new issues also need his approval.
 If he rejects an action, read his reason and adapt."""
+
+# Portable prompt = the box prompt with Joern's details taken out (each replacement must apply).
+_PORTABLE_EDITS = [
+    ("""You are Joern's research and coding assistant inside his PaperDesk phone app.
+Joern is a PhD researcher at TU Dresden (Chair of Railway Operations) working on LLMs and
+mixed-integer linear programming (MILP) for railway rescheduling. His GitHub account is joernmht.""",
+     """You are a research and coding assistant inside the user's PaperDesk phone app.
+{account}"""),
+    ("Style: he reads you on a phone.", "Style: the user reads you on a phone."),
+    ("on Joern's box show its live state", "on this machine show its live state"),
+    ("SCOPE: when Joern attached repos, they ARE the scope of his request.",
+     "SCOPE: when the user attached repos, they ARE the scope of their request."),
+    ("unless his message names them", "unless their message names them"),
+    ("Joern approves the push on his phone.", "The user approves the push on their phone."),
+    ("also need his approval.", "also need their approval."),
+    ("If he rejects an action, read his reason and adapt.", "If they reject an action, read their reason and adapt."),
+]
+
+
+def _portable_prompt() -> str:
+    p = SYSTEM_PROMPT
+    for old, new in _PORTABLE_EDITS:
+        if p.count(old) != 1:
+            raise RuntimeError(f"portable prompt edit does not apply: {old[:40]!r}")
+        p = p.replace(old, new)
+    return p
+
+
+PORTABLE_PROMPT = _portable_prompt()
+
+
+def system_prompt() -> str:
+    if BOX:
+        return SYSTEM_PROMPT
+    login = CONFIG.get("login")
+    return PORTABLE_PROMPT.replace("{account}", f"The user's GitHub account is {login}." if login else
+                                   "No GitHub account is connected yet (GitHub tools will fail).")
 
 
 def now() -> str:
@@ -191,7 +422,8 @@ def build_agent(row: dict):
 
     tid, model_name, approvals = row["id"], row["model"], row["approvals"]
     m = CONFIG["model"]
-    _check_eu(m)  # every agent build re-checks the endpoint
+    if BOX:
+        _check_eu(m)  # every agent build re-checks the endpoint
     extra = {}
     lim = model_limits(model_name)
     if "effective_input_tokens" in lim:  # a known window makes deepagents summarise at a fraction of it
@@ -204,12 +436,12 @@ def build_agent(row: dict):
     backend = CompositeBackend(default=sandbox.DockerSandbox(tid), routes={"/_agent/": StateBackend()},
                                artifacts_root="/_agent")
     ws = sandbox.workspace(tid)
-    prompt = SYSTEM_PROMPT + "\n\nAttached now:\n" + ("\n".join(
+    prompt = system_prompt() + "\n\nAttached now:\n" + ("\n".join(
         f"- {r['repo']} at {r['dir']} ({'WRITABLE, branch ' + r['branch'] if r['mode'] == 'write' else 'read-only'})"
         for r in ws) or "- nothing yet")
     prompt += ("\n\nApprovals: OFF. Writes (writable clone, PR, comment, issue) run directly, so be sure before you call them."
                if approvals == "auto" else
-               "\n\nApprovals: ON. Writes (writable clone, PR, comment, issue) wait for Joern's approve/reject.")
+               f"\n\nApprovals: ON. Writes (writable clone, PR, comment, issue) wait for {POLICY.user}'s approve/reject.")
     return create_deep_agent(model=llm, tools=tools, system_prompt=prompt, backend=backend,
                              interrupt_on=interrupt_on if approvals == "ask" else None,
                              checkpointer=CHECKPOINTER)
@@ -225,6 +457,7 @@ def forget_agent(tid: str) -> None:
 def agent_for(row: dict):
     """Cached compiled agent for a chat row (its settings are part of the key)."""
     global CHECKPOINTER
+    require_configured()
     with DB_LOCK:
         if CHECKPOINTER is None:
             from langgraph.checkpoint.sqlite import SqliteSaver
@@ -723,7 +956,7 @@ def _decision_command(pend: list[dict], decision: str, message: str | None):
     for p in pend:
         d = {"type": decision}
         if decision == "reject":
-            d["message"] = message or "Joern rejected this action."
+            d["message"] = message or f"{POLICY.user[:1].upper()}{POLICY.user[1:]} rejected this action."
         resume[p["id"]] = {"decisions": [dict(d) for _ in p["actions"]]}
     return Command(resume=resume)
 
@@ -787,7 +1020,15 @@ class ResumeIn(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    refresh()
     m = CONFIG["model"]
+    if not BOX:
+        state = (f"model <code>{m['name']}</code> on {HOSTING}" if not PROBLEMS
+                 else "not set up yet (" + "; ".join(PROBLEMS) + ")")
+        return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>PaperDesk agent</title><body style="font-family:sans-serif;padding:16px">
+<h2>PaperDesk agent is running</h2><p>Version {VERSION} &middot; {state}</p>
+<p>Set it up and chat from the PaperDesk app. API: <code>/api/agent/health</code>.</p>"""
     return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>PaperDesk agent</title><body style="font-family:sans-serif;padding:16px">
 <h2>PaperDesk agent is running</h2><p>Version {VERSION} &middot; model <code>{m['name']}</code>
@@ -796,13 +1037,25 @@ on {HOSTING} (EU-hosted only)</p><p>Chat from the PaperDesk app. API: <code>/api
 
 @app.get("/api/agent/health")
 def health():
-    models = CONFIG["model"].get("choices", [CONFIG["model"]["name"]])
-    return {"ok": True, "version": VERSION, "model": CONFIG["model"]["name"], "models": models,
+    ok = configured()
+    m = CONFIG["model"]
+    models = m.get("choices") or ([m["name"]] if m.get("name") else [])
+    providers = [dict(p) for p in PROVIDERS]
+    if BOX:  # the box's own endpoint is the ScaDS preset's truth
+        for p in providers:
+            if p["id"] == "scads":
+                p.update(base_url=m["base_url"], model=m["name"])
+    return {"ok": True, "version": VERSION, "model": m.get("name"), "models": models,
             "limits": {n: model_limits(n) for n in models}, "context_budget": CONTEXT_BUDGET,
-            "summarize_fraction": SUMMARIZE_AT, "hosting": HOSTING, "region": "EU",
+            "summarize_fraction": SUMMARIZE_AT, "hosting": HOSTING,
+            "region": "EU" if BOX or CONFIG.get("eu_only") else None,
             "approvals_default": APPROVALS_DEFAULT, "running": len(RUNS), "ping_s": PING_S,
+            "profile": "box" if BOX else "portable", "configured": ok, "problems": PROBLEMS,
+            "base_url": m.get("base_url") or None,
+            "github": True if BOX else bool(CONFIG.get("login")),
+            "github_login": POLICY.default_owner or None, "providers": providers,
             "features": ["github_read", "sandbox", "pull_requests", "approvals", "repos", "detached_runs",
-                         "events", "cancel", "subagents_toggle", "origin", "limits"]}
+                         "events", "cancel", "subagents_toggle", "origin", "limits", "config_reload"]}
 
 
 @app.get("/api/agent/threads", dependencies=[Depends(authed)])
@@ -819,7 +1072,10 @@ _REPO_CACHE: dict = {"t": 0.0, "repos": []}
 
 @app.get("/api/agent/repos", dependencies=[Depends(authed)])
 def repo_choices():
-    """Repos for the app's picker: Joern's GitHub repos minus the deny list (cached 10 min)."""
+    """Repos for the app's picker: the account's GitHub repos minus the deny list (cached 10 min)."""
+    refresh()
+    if not BOX and not CONFIG.get("login"):
+        raise HTTPException(503, "No GitHub account connected: save a GITHUB_TOKEN in the PaperDesk app (Settings > Keys).")
     if time.time() - _REPO_CACHE["t"] > 600:
         raw = json.loads(ghtools._gh("repo", "list", POLICY.default_owner, "--limit", "200", "--json",
                                      "nameWithOwner,description,visibility,pushedAt,isArchived"))
@@ -874,6 +1130,7 @@ def add_repo(tid: str, body: RepoSpec):
 
 @app.post("/api/agent/threads", dependencies=[Depends(authed)])
 def new_thread(body: NewThread):
+    require_configured()
     model = body.model or CONFIG["model"]["name"]
     if model not in CONFIG["model"].get("choices", [CONFIG["model"]["name"]]):
         raise HTTPException(400, f"unknown model {model}")
@@ -966,6 +1223,7 @@ def chat(tid: str, body: ChatIn):
     rejects). 409 while the chat is still running."""
     if not body.text.strip():
         raise HTTPException(400, "empty message")
+    require_configured()
     row, lock = _begin(tid)
     try:
         _set_title(tid, row, body.text)
@@ -981,6 +1239,7 @@ def resume(tid: str, body: ResumeIn):
     """Answer the pending approval(s) of a chat; runs and streams the continuation like /chat."""
     if body.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision must be approve or reject")
+    require_configured()
     row, lock = _begin(tid)
     try:
         pend = pending_approvals(agent_for(row), {"configurable": {"thread_id": tid}})
@@ -1016,6 +1275,9 @@ def cancel(tid: str):
     run.activity = "cancelling"
     threading.Thread(target=sandbox.interrupt, args=(tid,), daemon=True).start()
     return {"ok": True, "run": run.status()}
+
+
+refresh()  # portable: first read of agent.toml / secrets.env (the box loaded config.toml above)
 
 
 def main():

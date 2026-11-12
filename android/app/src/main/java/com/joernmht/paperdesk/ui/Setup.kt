@@ -9,6 +9,15 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.border
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import com.joernmht.paperdesk.AgentSetup
+import com.joernmht.paperdesk.Secret
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -60,30 +69,41 @@ const val INSTALL_CMD = "curl -fsSL https://raw.githubusercontent.com/joernmht/P
 private const val TAILSCALE_PKG = "com.tailscale.ipn"
 private const val RM_CONNECT_URL = "https://my.remarkable.com/device/browser/connect"
 
-/** The wizard's steps and how to move between them. Steps 5 and 6 exist only if the server offers them. */
+/**
+ * The wizard's steps and how to move between them. Steps after CONNECT exist only if the server offers them;
+ * the order puts Keys before the steps that need a key (chat agent: LLM_API_KEY; papers: git tokens).
+ */
 object SetupFlow {
     const val WELCOME = 0
     const val TAILSCALE = 1
     const val MACHINE = 2
     const val INSTALL = 3
     const val CONNECT = 4
-    const val REMARKABLE = 5
-    const val TOPICS = 6
-    const val DONE = 7
+    const val KEYS = 5
+    const val AGENT = 6
+    const val PAPERS = 7
+    const val REMARKABLE = 8
+    const val TOPICS = 9
+    const val DONE = 10
     const val CLOSE = -1
 
+    private fun offered(step: Int, info: ServerInfo) = when (step) {
+        KEYS -> info.secrets
+        AGENT -> info.agentSetup
+        PAPERS -> info.papersEdit
+        REMARKABLE -> info.rmConnect
+        TOPICS -> info.topics
+        else -> true
+    }
+
     /** Steps shown in the indicator. Before pairing nobody knows what the server offers, so all are listed. */
-    fun visible(paired: Boolean, info: ServerInfo): List<Int> =
-        listOf(WELCOME, TAILSCALE, MACHINE, INSTALL, CONNECT) +
-            listOfNotNull(REMARKABLE.takeIf { !paired || info.rmConnect }, TOPICS.takeIf { !paired || info.topics }, DONE)
+    fun visible(paired: Boolean, info: ServerInfo): List<Int> = (WELCOME..DONE).filter { it <= CONNECT || !paired || offered(it, info) }
 
     fun next(from: Int, info: ServerInfo, solo: Boolean): Int = when {
         from < CONNECT -> from + 1
         solo -> CLOSE
-        from == CONNECT && info.rmConnect -> REMARKABLE
-        from <= REMARKABLE && info.topics -> TOPICS
-        from < DONE -> DONE
-        else -> CLOSE
+        from >= DONE -> CLOSE
+        else -> ((from + 1)..DONE).first { offered(it, info) }
     }
 
     /** null = leave the app (system default). A paired app leaves the wizard instead of walking back into steps 0–3. */
@@ -92,9 +112,7 @@ object SetupFlow {
         from < CONNECT -> from - 1
         from == CONNECT -> if (paired) CLOSE else INSTALL
         solo -> CLOSE
-        from == REMARKABLE -> CONNECT
-        from == TOPICS -> if (info.rmConnect) REMARKABLE else CONNECT
-        else -> if (info.topics) TOPICS else if (info.rmConnect) REMARKABLE else CONNECT
+        else -> ((from - 1) downTo CONNECT).first { it == CONNECT || offered(it, info) }
     }
 }
 
@@ -119,6 +137,9 @@ fun SetupWizard(app: AppCtx, step: Int, solo: Boolean, paired: Boolean, goto: (I
             SetupFlow.MACHINE -> MachineStep(app, next)
             SetupFlow.INSTALL -> InstallStep(app, next)
             SetupFlow.CONNECT -> ConnectStep(app, paired, onPaired)
+            SetupFlow.KEYS -> KeysStep(app, solo, next)
+            SetupFlow.AGENT -> AgentStep(app, solo, next, refresh)
+            SetupFlow.PAPERS -> PapersStep(app, solo, next)
             SetupFlow.REMARKABLE -> RemarkableStep(app, solo, next, refresh)
             SetupFlow.TOPICS -> TopicsStep(app, next)
             else -> DoneStep(next)
@@ -136,7 +157,9 @@ private fun StepIndicator(steps: List<Int>, current: Int) {
         steps.forEach { s ->
             when {
                 s < current -> Form(FormKind.Circle, 14.dp, label = "done")
-                s == current -> Form(FormKind.Triangle, 18.dp, label = "current step")
+                s == current -> Box(Modifier.background(BYellow).padding(4.dp)) {
+                    CompositionLocalProvider(LocalContentColor provides BInk) { Form(FormKind.Triangle, 14.dp, label = "current step") }
+                }
                 else -> Form(FormKind.Square, 14.dp, label = "to do", filled = false)
             }
         }
@@ -157,7 +180,8 @@ private fun Page(title: String, vararg lines: String, content: @Composable Colum
 /** Status as form + words: ● good, ■ not yet. */
 @Composable
 private fun StatusLine(ok: Boolean, text: String) {
-    Row(Modifier.fillMaxWidth().border(BorderW, MaterialTheme.colorScheme.onSurface).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().background(if (ok) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
+        .padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
         Form(if (ok) FormKind.Circle else FormKind.Square, 16.dp, label = if (ok) "ok" else "not yet")
         Spacer(Modifier.width(12.dp))
         Text(text, style = MaterialTheme.typography.titleSmall)
@@ -235,7 +259,7 @@ private fun InstallStep(app: AppCtx, next: () -> Unit) {
     ) {
         SelectionContainer {
             Text(INSTALL_CMD, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.fillMaxWidth().border(BorderW, MaterialTheme.colorScheme.onSurface).padding(12.dp))
+                modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant).padding(16.dp))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             BOutlinedButton(onClick = {
@@ -407,6 +431,147 @@ private fun RemarkableStep(app: AppCtx, solo: Boolean, next: () -> Unit, refresh
             }
         }) { Text("Connect") }
         TextButton(onClick = next) { Text(if (solo) "Close" else "Skip") }
+    }
+}
+
+// ------------------------------------------------------------------ keys
+
+@Composable
+private fun KeysStep(app: AppCtx, solo: Boolean, next: () -> Unit) {
+    val list = remember { androidx.compose.runtime.mutableStateListOf<Secret>() }
+    var error by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        try { val r = app.api.secrets(); list.clear(); list.addAll(r); error = null }
+        catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
+        loading = false
+    }
+    Page(
+        "Keys",
+        "Some services need a key or token: the language model for the chat agent, Overleaf or GitHub for your papers, literature search.",
+        "A key goes once over your private Tailscale link to your own machine and is stored there, in a file only you can read. The app never shows it again.",
+    ) {
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        error?.let { ErrorLine("Cannot load the list of keys: $it", Modifier) }
+        list.forEach { k ->
+            SecretRow(app, k) { updated -> list.clear(); list.addAll(updated) }
+            Hairline()
+        }
+        val missing = list.count { !it.set && !it.optional }
+        if (missing > 0) Text("$missing required key${if (missing == 1) "" else "s"} not set yet. You can add them later in Settings → Keys.",
+            style = MaterialTheme.typography.bodySmall)
+        BFilledButton(form = FormKind.Triangle, onClick = next) { Text(if (solo) "Done" else "Next") }
+    }
+}
+
+@Composable
+private fun SecretRow(app: AppCtx, k: Secret, onSaved: (List<Secret>) -> Unit) {
+    var value by remember(k.name) { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (k.set) { Form(FormKind.Circle, 12.dp, label = "set"); Spacer(Modifier.width(8.dp)) }
+            Text(k.label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            Text(if (k.set) "set" else if (k.optional) "optional" else "needed", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (k.help.isNotBlank()) Text(k.help, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(value, { value = it.trim() }, Modifier.weight(1f), singleLine = true,
+                placeholder = { Text(if (k.set) "Replace the stored key" else "Paste the key") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false))
+            BFilledButton(modifier = Modifier.padding(start = 8.dp), enabled = value.isNotBlank() && !busy, onClick = {
+                busy = true
+                app.run("${k.label} saved", { app.api.setSecret(k.name, value) }, onErr = { busy = false }) { r -> busy = false; value = ""; onSaved(r) }
+            }) { Text("Save") }
+        }
+        k.url?.let { u -> TextButton(onClick = { app.openUrl(u) }) { Text("Get one") } }
+    }
+}
+
+// ------------------------------------------------------------------ chat agent
+
+@Composable
+private fun AgentStep(app: AppCtx, solo: Boolean, next: () -> Unit, refresh: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var setup by remember { mutableStateOf<AgentSetup?>(null) }
+    var baseUrl by rememberSaveable { mutableStateOf("") }
+    var model by rememberSaveable { mutableStateOf("") }
+    var pick by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var done by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        try {
+            val s = app.api.agentSetup(); setup = s
+            if (baseUrl.isBlank()) baseUrl = s.baseUrl
+            if (model.isBlank()) model = s.model
+            done = s.configured
+        } catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
+    }
+    Page(
+        "Chat agent",
+        "The Chat tab talks to an assistant on your machine that can read your papers and repos. It needs a language model: the address of a provider (any OpenAI-compatible service) and a model name.",
+        "Its key is LLM_API_KEY in the Keys step.",
+    ) {
+        if (done) StatusLine(true, "The chat agent is set up")
+        val providers = setup?.providers.orEmpty()
+        if (providers.isNotEmpty()) Box {
+            BOutlinedButton(onClick = { pick = true }) { Text("Choose a provider") }
+            DropdownMenu(pick, { pick = false }) {
+                providers.forEach { p ->
+                    DropdownMenuItem(text = { Text(p.label) }, onClick = { pick = false; baseUrl = p.baseUrl; model = p.model })
+                }
+            }
+        }
+        providers.firstOrNull { it.baseUrl == baseUrl }?.url?.let { u -> TextButton(onClick = { app.openUrl(u) }) { Text("Provider's page (get a key)") } }
+        OutlinedTextField(baseUrl, { baseUrl = it.trim() }, Modifier.fillMaxWidth(), label = { Text("LLM base URL") },
+            placeholder = { Text("https://…/v1") }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false))
+        OutlinedTextField(model, { model = it.trim() }, Modifier.fillMaxWidth(), label = { Text("Model name") }, singleLine = true,
+            keyboardOptions = KeyboardOptions(autoCorrectEnabled = false))
+        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        error?.let { ErrorLine(it, Modifier) }
+        BFilledButton(form = FormKind.Circle, enabled = !busy && baseUrl.startsWith("http") && model.isNotBlank(), onClick = {
+            busy = true; error = null
+            scope.launch {
+                try {
+                    var job = app.api.startAgentSetup(baseUrl, model) ?: throw IllegalStateException("the server started no job")
+                    while (job.active) { delay(2000); job = app.api.job(job.id) }
+                    if (job.status != "done") throw IllegalStateException(job.summary ?: "the agent could not be set up")
+                    val h = app.api.health()
+                    Prefs.setServerInfo(ctx, h)
+                    val url = ServerInfo.from(h).agentUrl
+                    if (url.isNotBlank()) Prefs.setAgentUrl(ctx, url)
+                    done = true
+                    refresh()
+                } catch (e: Exception) {
+                    error = "Not set up: ${e.message ?: e.javaClass.simpleName}"
+                }
+                busy = false
+            }
+        }) { Text(if (done) "Set up again" else "Set up the agent") }
+        BOutlinedButton(form = FormKind.Triangle, onClick = next) { Text(if (solo) "Done" else if (done) "Next" else "Skip") }
+    }
+}
+
+// ------------------------------------------------------------------ papers
+
+@Composable
+private fun PapersStep(app: AppCtx, solo: Boolean, next: () -> Unit) {
+    val added = remember { androidx.compose.runtime.mutableStateListOf<String>() }
+    LaunchedEffect(Unit) { runCatching { app.api.papers() }.getOrNull()?.let { ps -> added.clear(); added.addAll(ps.map { it.label }) } }
+    Page(
+        "Add your paper repos",
+        "PaperDesk can keep your LaTeX papers: edit them on the phone, comment, build the PDF. Each paper is a git repo, on Overleaf (Menu → Git) or GitHub.",
+    ) {
+        added.forEach { l ->
+            Row(verticalAlignment = Alignment.CenterVertically) { Form(FormKind.Circle, 12.dp); Spacer(Modifier.width(8.dp)); Text(l) }
+        }
+        AddPaperForm(app) { ps -> added.clear(); added.addAll(ps.map { it.label }) }
+        TextButton(onClick = next) { Text(if (solo) "Done" else if (added.isEmpty()) "Skip" else "Next") }
     }
 }
 
