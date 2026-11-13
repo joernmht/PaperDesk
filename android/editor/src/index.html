@@ -27,6 +27,24 @@
   .pd-circle { background-color: var(--blue); border-radius: 50%; }
   .pd-square { background-color: var(--red); }
   .pd-tri { background-color: var(--yellow); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+  /* the tappable badge at the end of a marked text (opens its comment) */
+  .pd-badge { width: .55em; height: .55em; margin: 0 .1em; padding: .4em; vertical-align: .05em; }
+
+  /* simple view: prose font, Markdown-like headings, LaTeX structure as quiet chips */
+  body.simple .cm-scroller { font-family: system-ui, Roboto, 'Noto Sans', sans-serif !important; line-height: 1.6 !important; }
+  .pd-h { font-weight: 700; color: var(--ink); }
+  .pd-h1 { font-size: 1.45em; } .pd-h2 { font-size: 1.25em; } .pd-h3 { font-size: 1.1em; } .pd-h4 { font-style: italic; }
+  .pd-hmark { color: var(--muted); font-weight: 400; font-family: ui-monospace, 'Roboto Mono', monospace; }
+  .pd-s-b { font-weight: 700; } .pd-s-i { font-style: italic; } .pd-s-u { text-decoration: underline; }
+  .pd-s-sc { font-variant: small-caps; } .pd-s-fn { color: var(--muted); font-size: .92em; }
+  .pd-s-tt { font-family: ui-monospace, 'Roboto Mono', monospace; background: var(--active); }
+  .pd-chip { display: inline-block; font-size: .78em; line-height: 1.3; padding: 0 .4em; margin: 0 .1em; border: 1px solid currentColor;
+             border-radius: 2px; vertical-align: .1em; white-space: nowrap; max-width: 14em; overflow: hidden; text-overflow: ellipsis;
+             font-family: system-ui, Roboto, sans-serif; font-style: normal; font-weight: 400; }
+  .pd-chip-cite { color: var(--blue); } .pd-chip-ref { color: var(--olive); }
+  .pd-chip-env, .pd-chip-fn { color: var(--muted); }
+  .pd-bullet { color: var(--blue); font-weight: 700; padding-right: .5em; }
+  body.simple .pd-texcomment { color: var(--muted); opacity: .65; }
 </style>
 </head>
 <body>

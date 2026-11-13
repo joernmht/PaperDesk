@@ -22,15 +22,16 @@ const host = window.Android || {   // no bridge (desktop browser while developin
 };
 
 import { parseComments, escapeComment as escape, selectionProblem } from "./comments.js";
+import { scanSimple, HEADING_FOR } from "./simple.js";
 
 // ------------------------------------------------------------------ decorations
 
 class FormWidget extends WidgetType {
-  constructor(shape, index, title) { super(); this.shape = shape; this.index = index; this.title = title; }
-  eq(o) { return o.shape === this.shape && o.index === this.index && o.title === this.title; }
+  constructor(shape, index, title, badge = false) { super(); this.shape = shape; this.index = index; this.title = title; this.badge = badge; }
+  eq(o) { return o.shape === this.shape && o.index === this.index && o.title === this.title && o.badge === this.badge; }
   toDOM() {
     const s = document.createElement("span");
-    s.className = "pd-w pd-" + this.shape;
+    s.className = "pd-w pd-" + this.shape + (this.badge ? " pd-badge" : "");
     s.dataset.ci = String(this.index);
     s.title = this.title;
     s.setAttribute("role", "button");
@@ -61,7 +62,11 @@ function build(text, showSource) {
     }
     hidden(c.from, c.aFrom);
     ranges.push((c.kind === "pdmark" ? markPd : c.kind === "rmhl" ? markHl : markDel).range(c.aFrom, c.aTo));
-    hidden(c.aTo, c.to);
+    // the closing syntax (}{comment} or }) becomes a small badge: tapping it opens the comment, while a tap on the
+    // marked text only moves the cursor so the text can be edited like any other
+    const b = Decoration.replace({ widget: new FormWidget(c.readOnly ? "square" : "tri", i,
+      (c.readOnly ? "reMarkable: " : "Comment: ") + (c.comment || c.marked || ""), true) });
+    ranges.push(b.range(c.aTo, c.to)); atomic.push(b.range(c.aTo, c.to));
   });
   return { comments, deco: Decoration.set(ranges, true), atomic: Decoration.set(atomic, true) };
 }
@@ -78,6 +83,80 @@ const commentField = StateField.define({
     EditorView.decorations.from(f, (v) => v.deco),
     EditorView.atomicRanges.of((view) => view.state.field(f).atomic),
   ],
+});
+
+// ------------------------------------------------------------------ simple view (Markdown-like)
+
+class TextWidget extends WidgetType {
+  constructor(text, cls) { super(); this.text = text; this.cls = cls; }
+  eq(o) { return o.text === this.text && o.cls === this.cls; }
+  toDOM() { const s = document.createElement("span"); s.className = this.cls; s.textContent = this.text; return s; }
+  ignoreEvent() { return false; }
+}
+
+const setSimple = StateEffect.define();
+const STYLE_MARK = {};
+for (const c of ["b", "i", "tt", "u", "sc", "fn"]) STYLE_MARK[c] = Decoration.mark({ class: "pd-s-" + c });
+const HEAD_MARK = [1, 2, 3, 4].map((l) => Decoration.mark({ class: "pd-h pd-h" + l }));
+const TEX_COMMENT = Decoration.mark({ class: "pd-texcomment" });
+const LIST_ENVS = new Set(["itemize", "enumerate", "description"]);
+
+function buildSimple(state) {
+  const cf = state.field(commentField);
+  if (cf.show) return { deco: Decoration.none, atomic: Decoration.none };
+  const skip = [];
+  for (const c of cf.comments) {
+    if (c.kind === "pdnote" || c.kind === "rmnote" || c.aFrom === c.aTo) skip.push([c.from, c.to]);
+    else { skip.push([c.from, c.aFrom]); skip.push([c.aTo, c.to]); }
+  }
+  const text = state.doc.toString(), ranges = [], atomic = [];
+  const rep = (a, b, widget) => {
+    if (b <= a && !widget) return;
+    const d = Decoration.replace(widget ? { widget } : {});
+    ranges.push(d.range(a, b)); atomic.push(d.range(a, b));
+  };
+  for (const it of scanSimple(text, skip)) {
+    if (it.t === "head") {
+      rep(it.from, it.cFrom, new TextWidget("#".repeat(it.level) + " ", "pd-hmark"));
+      if (it.cTo > it.cFrom) ranges.push(HEAD_MARK[it.level - 1].range(it.cFrom, it.cTo));
+      rep(it.cTo, it.to);
+    } else if (it.t === "style") {
+      rep(it.from, it.cFrom, it.cls === "fn" ? new TextWidget("fn", "pd-chip pd-chip-fn") : null);
+      if (it.cTo > it.cFrom) ranges.push(STYLE_MARK[it.cls].range(it.cFrom, it.cTo));
+      rep(it.cTo, it.to);
+    } else if (it.t === "cite") rep(it.from, it.to, new TextWidget("[" + it.label + "]", "pd-chip pd-chip-cite"));
+    else if (it.t === "ref") rep(it.from, it.to, new TextWidget("→ " + it.label, "pd-chip pd-chip-ref"));
+    else if (it.t === "hide") rep(it.from, it.to);
+    else if (it.t === "item") rep(it.from, it.to, new TextWidget("•", "pd-bullet"));
+    else if (it.t === "env") rep(it.from, it.to, new TextWidget((it.open ? "▾ " : "▴ ") + (LIST_ENVS.has(it.env) ? "list" : it.env),
+      "pd-chip pd-chip-env"));
+    else if (it.t === "texcomment" && it.to > it.from) ranges.push(TEX_COMMENT.range(it.from, it.to));
+  }
+  return { deco: Decoration.set(ranges, true), atomic: Decoration.set(atomic, true) };
+}
+
+const simpleField = StateField.define({
+  create() { return { on: false, deco: Decoration.none, atomic: Decoration.none }; },
+  update(v, tr) {
+    let on = v.on, touched = tr.docChanged;
+    for (const e of tr.effects) { if (e.is(setSimple)) on = e.value; if (e.is(setShowSource)) touched = true; }
+    if (!touched && on === v.on) return v;
+    return on ? { on, ...buildSimple(tr.state) } : { on, deco: Decoration.none, atomic: Decoration.none };
+  },
+  provide: (f) => [
+    EditorView.decorations.from(f, (v) => v.deco),
+    EditorView.atomicRanges.of((view) => view.state.field(f).atomic),
+  ],
+});
+
+/** Simple view: "# " / "## " / "### " typed at the start of a line becomes \section{} / \subsection{} / \subsubsection{}. */
+const markdownInput = EditorView.inputHandler.of((v, from, to, text) => {
+  if (text !== " " || from !== to || !v.state.field(simpleField).on || v.state.field(commentField).show) return false;
+  const line = v.state.doc.lineAt(from), m = /^(\s*)(#{1,3})$/.exec(v.state.sliceDoc(line.from, from));
+  if (!m) return false;
+  const start = line.from + m[1].length, ins = "\\" + HEADING_FOR[m[2].length] + "{}";
+  v.dispatch({ changes: { from: start, to: from, insert: ins }, selection: { anchor: start + ins.length - 1 }, userEvent: "input" });
+  return true;
 });
 
 // ------------------------------------------------------------------ look
@@ -133,12 +212,7 @@ const taps = EditorView.domEventHandlers({
     const f = v.state.field(commentField);
     const w = e.target.closest && e.target.closest("[data-ci]");
     if (w) { const i = +w.dataset.ci; if (f.comments[i]) report(f.comments[i], i); return true; }
-    if (f.show) return false;
-    const pos = v.posAtCoords({ x: e.clientX, y: e.clientY });
-    if (pos == null) return false;
-    const i = f.comments.findIndex((c) => c.aFrom != null && pos >= c.aFrom && pos <= c.aTo && v.state.selection.main.empty);
-    if (i >= 0) report(f.comments[i], i);
-    return false;   // the cursor still moves there
+    return false;   // a tap on marked text just places the cursor: the text stays editable
   },
 });
 
@@ -151,7 +225,7 @@ const view = new EditorView({
       keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
       StreamLanguage.define(stex), syntaxHighlighting(highlight),
       search({ top: true }), highlightSelectionMatches(),
-      EditorView.lineWrapping, commentField, theme, notifier, taps,
+      EditorView.lineWrapping, commentField, simpleField, markdownInput, theme, notifier, taps,
       readOnly.of([]),
       EditorView.contentAttributes.of({ autocapitalize: "off", autocorrect: "off", spellcheck: "false" }),
     ],
@@ -186,6 +260,16 @@ window.pd = {
   markClean() { cleanDoc = view.state.doc; lastDirty = false; host.onChange(false); },
   setReadOnly(on) { view.dispatch({ effects: readOnly.reconfigure(on ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []) }); },
   setShowSource(on) { view.dispatch({ effects: setShowSource.of(!!on) }); },
+  /** Simple view: headings as # / ##, bold/italic shown as such, \cite / \ref as chips, \label hidden. */
+  setSimple(on) { document.body.classList.toggle("simple", !!on); view.dispatch({ effects: setSimple.of(!!on) }); view.requestMeasure(); },
+  /** Select the text a comment marks, so it can be retyped (from the comment sheet's "Edit the text"). */
+  selectMarked(from, kind) {
+    const c = findComment(from, kind);
+    if (!c || c.aFrom == null) return "That comment changed in the meantime. Tap it again.";
+    view.dispatch({ selection: { anchor: c.aFrom, head: c.aTo }, effects: EditorView.scrollIntoView(c.aFrom, { y: "center" }) });
+    view.focus();
+    return "";
+  },
   setFontSize(px) { document.documentElement.style.setProperty("--fs", px + "px"); view.requestMeasure(); },
   setDark(on) { document.body.classList.toggle("dark", !!on); },
   focus() { view.focus(); },

@@ -33,6 +33,8 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material.icons.filled.AddComment
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -147,6 +149,11 @@ private class Bridge(val onReady: () -> Unit, val onChange: (Boolean) -> Unit, v
 }
 
 /** Symbol bar: label → (inserted before the selection, after it). */
+/** Symbol bar in the simple view: Markdown-like labels, LaTeX underneath. */
+private val SIMPLE_SYMBOLS = listOf("#" to ("\\section{" to "}"), "##" to ("\\subsection{" to "}"), "###" to ("\\subsubsection{" to "}"),
+    "B" to ("\\textbf{" to "}"), "I" to ("\\emph{" to "}"), "•" to ("\\item " to ""), "$ $" to ("$" to "$"),
+    "cite" to ("\\cite{" to "}"), "ref" to ("\\ref{" to "}"), "\\" to ("\\" to ""))
+
 private val SYMBOLS = listOf("\\" to ("\\" to ""), "{ }" to ("{" to "}"), "$ $" to ("$" to "$"), "%" to ("%" to ""),
     "&" to ("&" to ""), "_" to ("_" to ""), "^" to ("^" to ""), "~" to ("~" to ""),
     "\\cite{}" to ("\\cite{" to "}"), "\\ref{}" to ("\\ref{" to "}"))
@@ -171,6 +178,7 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
     var status by remember { mutableStateOf<String?>(null) }
     var showSource by remember { mutableStateOf(false) }
     var font by remember { mutableIntStateOf(Prefs.editorFont(ctx)) }
+    var simple by remember { mutableStateOf(Prefs.editorSimple(ctx)) }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
@@ -208,7 +216,7 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
     DisposableEffect(Unit) { onDispose { web.destroy() } }
 
     fun show(text: String, clean: String, line: Int = target.line, col: Int = target.col, openComment: Boolean = target.openComment) {
-        web.evaluateJavascript("pd.setDark($dark); pd.setFontSize($font); pd.setShowSource($showSource);" +
+        web.evaluateJavascript("pd.setDark($dark); pd.setFontSize($font); pd.setShowSource($showSource); pd.setSimple($simple);" +
             "pd.load(${q(text)}, ${q(clean)}, $line, $col);" + (if (openComment) "pd.openCommentAt($line, $col);" else ""), null)
         shown = true
     }
@@ -287,6 +295,10 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
+            // simple view (Markdown-like) <-> plain LaTeX; the label names the view you switch TO
+            TextButton(onClick = {
+                simple = !simple; Prefs.setEditorSimple(ctx, simple); web.evaluateJavascript("pd.setSimple($simple)", null)
+            }) { Text(if (simple) "LaTeX" else "Simple", fontFamily = if (simple) FontFamily.Monospace else FontFamily.Default) }
             IconButton(onClick = { searching = !searching }) { Icon(Icons.Filled.Search, "Search") }
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
@@ -321,6 +333,20 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
         // ---- the editor
         Box(Modifier.weight(1f).fillMaxWidth()) {
             AndroidView({ web }, Modifier.fillMaxSize())
+            // the comment button: big, lower right, thumb reach. A selection gets a comment, else a note at the cursor.
+            if (shown && loadError == null) ExtendedFloatingActionButton(
+                onClick = {
+                    scope.launch {
+                        val why = web.js("pd.checkComment()")
+                        if (!why.isNullOrBlank()) problem = why else newComment = true
+                    }
+                },
+                icon = { Icon(Icons.Filled.AddComment, null) },
+                text = { Text(if (hasSel) "Comment" else "Note") },
+                shape = androidx.compose.ui.graphics.RectangleShape,
+                containerColor = BBlue, contentColor = BPaper,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+            )
             loadError?.let {
                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
                     ErrorLine("Cannot open ${target.path}: $it", Modifier)
@@ -332,20 +358,16 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
         // ---- comment button + symbol bar (sits on top of the keyboard)
         Hairline()
         Row(Modifier.fillMaxWidth().navigationBarsPadding().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-            BOutlinedButton(form = FormKind.Circle, enabled = shown, onClick = {
-                scope.launch {
-                    val why = web.js("pd.checkComment()")
-                    if (!why.isNullOrBlank()) problem = why else newComment = true
-                }
-            }) { Text(if (hasSel) "Comment" else "Note") }
-            Box(Modifier.width(1.dp).height(24.dp).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)))
             Row(Modifier.weight(1f).horizontalScroll(rememberScrollState())) {
-                SYMBOLS.forEach { (label, ins) ->
+                (if (simple && !showSource) SIMPLE_SYMBOLS else SYMBOLS).forEach { (label, ins) ->
                     val (before, after) = ins
                     Box(Modifier.heightIn(min = 48.dp).clickable(enabled = shown) {
                         web.evaluateJavascript("pd.snippet(${q(before)}, ${q(after)})", null)
                     }.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
-                        Text(label, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
+                        Text(label, style = MaterialTheme.typography.titleMedium,
+                            fontFamily = if (simple && !showSource && label != "\\") FontFamily.Default else FontFamily.Monospace,
+                            fontWeight = if (label == "B") FontWeight.Bold else null,
+                            fontStyle = if (label == "I") FontStyle.Italic else null)
                     }
                 }
             }
@@ -369,9 +391,12 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
                         overflow = TextOverflow.Ellipsis, modifier = Modifier.background(BYellow.copy(alpha = 0.35f)).padding(horizontal = 8.dp, vertical = 4.dp))
                 }
                 c.comment?.let { Text(it, style = MaterialTheme.typography.bodyLarge) }
-                if (c.readOnly) Text("Written on the reMarkable. It can be resolved, not edited.", style = MaterialTheme.typography.bodySmall,
+                if (c.readOnly) Text("Written on the reMarkable: the note itself can be resolved, not edited. The marked text can be edited.", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Hairline()
+                if (c.isMark) BOutlinedButton(form = FormKind.Circle, modifier = Modifier.fillMaxWidth(), onClick = {
+                    tap = null; runJs("pd.selectMarked(${c.from}, ${q(c.kind)})")
+                }) { Text("Edit the marked text", Modifier.weight(1f)) }
                 if (!c.readOnly && c.comment != null) BOutlinedButton(form = FormKind.Triangle, modifier = Modifier.fillMaxWidth(), onClick = {
                     askComment = c; tap = null
                 }) { Text("Edit comment", Modifier.weight(1f)) }

@@ -5,7 +5,7 @@
 const MACRO = /\\(pdmark|pdnote|rmnote|rmhl|rmdel)(?![A-Za-z@])/g;
 
 /** End index (exclusive, after the closing brace) of the group opening at text[pos] == open, or -1. */
-function group(text, pos, open = "{", close = "}") {
+export function group(text, pos, open = "{", close = "}") {
   if (text[pos] !== open) return -1;
   let depth = 0;
   for (let i = pos; i < text.length; i++) {

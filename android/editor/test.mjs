@@ -21,3 +21,21 @@ assert.match(selectionProblem("{\\em x"), /unbalanced/);
 assert.match(selectionProblem("x } {"), /unbalanced/);
 assert.equal(selectionProblem(String.raw`a \{ b`), "");
 console.log("comments.js: all checks pass");
+
+// ---- simple view
+import { scanSimple } from "./src/simple.js";
+const s = String.raw`\section{Intro \emph{now}}\label{sec:i}
+Text \textbf{bold} \cite[p.~3]{a, b} see \ref{x}. 50\% done % a note \textbf{no}
+\begin{itemize}
+  \item one
+\end{itemize}
+\pdmark{\textbf{inside}}{c \textbf{x}}`;
+const skip = [[s.indexOf("\\pdmark"), s.indexOf("\\pdmark") + 8], [s.lastIndexOf("}{c"), s.length]];
+const items = scanSimple(s, skip);
+const kinds = items.map((i) => i.t + (i.level || i.cls || (i.env ? ":" + i.env : "")));
+assert.deepEqual(kinds, ["head1", "stylei", "hide", "styleb", "cite", "ref", "texcomment", "env:itemize", "item", "env:itemize", "styleb"]);
+assert.equal(s.slice(items[0].cFrom, items[0].cTo), String.raw`Intro \emph{now}`);
+assert.equal(items[4].label, "a, b");
+assert.equal(s.slice(items[8].from, items[8].to), "\\item ");
+assert.equal(s.slice(items[10].cFrom, items[10].cTo), "inside");
+console.log("simple.js: all checks pass");

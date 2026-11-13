@@ -32,6 +32,9 @@ object Prefs {
     /** Editor font size in sp, persisted. */
     fun editorFont(ctx: Context): Int = sp(ctx).getInt("editor_font", 15)
     fun setEditorFont(ctx: Context, v: Int) = sp(ctx).edit().putInt("editor_font", v.coerceIn(10, 28)).apply()
+    /** Editor view: simple (Markdown-like, LaTeX structure hidden) or the plain LaTeX. Simple by default. */
+    fun editorSimple(ctx: Context): Boolean = sp(ctx).getBoolean("editor_simple", true)
+    fun setEditorSimple(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("editor_simple", v).apply()
     /** Last /api/health answer, so the tabs match the server's features before the first request returns. */
     fun serverInfo(ctx: Context): ServerInfo =
         sp(ctx).getString("server_info", null)?.let { runCatching { ServerInfo.from(JSONObject(it)) }.getOrNull() } ?: ServerInfo.LEGACY
