@@ -3,6 +3,7 @@ package com.joernmht.paperdesk.ui
 import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -184,6 +185,9 @@ fun EditorScreen(app: AppCtx, target: EditorTarget, onClose: () -> Unit) {
 
     val web = remember {
         WebView(ctx).apply {
+            // Without explicit layout params AndroidView leaves the WebView on WRAP_CONTENT, which makes Chromium size the
+            // page viewport to its content: html/body/#ed { height: 100% } collapse to 0 and CodeMirror draws no lines.
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             settings.javaScriptEnabled = true
             settings.allowFileAccess = false
             settings.allowContentAccess = false
